@@ -85,9 +85,13 @@ export interface LabelOptions extends ViewOptions {
 }
 
 export class Label extends View {
+  // What the text was last set to through this wrapper, so setting it again is free.
+  #text: string;
+
   constructor(options: LabelOptions = {}) {
     const f = objc.NSTextField.labelWithString_(options.text ?? "");
     super(f, options);
+    this.#text = options.text ?? "";
     this.applyLabelOptions(options);
   }
 
@@ -117,8 +121,17 @@ export class Label extends View {
     return str(this.native.stringValue());
   }
 
+  /**
+   * Set the text. The same text again does nothing: `setStringValue:` marks the
+   * label's size stale and its window for layout even when nothing changed, and
+   * a readout refreshed twenty times a second would otherwise relayout twenty
+   * times a second for digits that did not move.
+   */
   set text(v: string) {
-    this.native.setStringValue_(v ?? "");
+    const next = v ?? "";
+    if (next === this.#text) return;
+    this.#text = next;
+    this.native.setStringValue_(next);
   }
 
   set color(v: any) {
@@ -151,10 +164,13 @@ export interface ButtonOptions extends ViewOptions {
 
 export class Button extends View {
   #handler: ((b: Button) => void) | null = null;
+  // What the title was last set to through this wrapper, so setting it again is free.
+  #title: string;
 
   constructor(options: ButtonOptions = {}) {
     const b = objc.NSButton.buttonWithTitle_target_action_(options.title ?? "", null, null);
     super(b, options);
+    this.#title = options.title ?? "";
 
     if (options.symbol) {
       const img = objc.NSImage.imageWithSystemSymbolName_accessibilityDescription_(
@@ -196,8 +212,12 @@ export class Button extends View {
     return str(this.native.title());
   }
 
+  /** Set the title. The same title again does nothing — see `Label.text`. */
   set title(v: string) {
-    this.native.setTitle_(v);
+    const next = v ?? "";
+    if (next === this.#title) return;
+    this.#title = next;
+    this.native.setTitle_(next);
   }
 
   get enabled(): boolean {

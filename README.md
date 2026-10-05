@@ -104,6 +104,12 @@ scene.onFrame(({ dt }) => { cube.rotation.y += dt; });
 
 `box`, `sphere`, `plane`, `cylinder` and `cone`, or your own vertex data through `geometry()`. nodes that share a shape and a material get batched into one instanced draw, so the draw call count follows the number of distinct meshes rather than the number of objects. two hundred cubes is one draw.
 
+a frame isn't on screen when you draw it. on a 120 Hz macbook panel it gets there 24–32 ms later. `scene.stats.present` says how long, measured from each drawable's own `presentedTime`, and `screenLatencyMs(stats.present)` is the number to add to *now* when you're deciding what to draw — anything synced to music should draw what'll be true when the picture is seen, not when it was drawn.
+
+a view that animates asks `view.frameDue` before drawing. `nextDrawable` blocks until the display frees a drawable, and a view drawn whenever the run loop comes round spends a third of the main thread in there, so a native thread does that waiting instead: it keeps one drawable ready and wakes the run loop when it has. `frameDue` is true when one is. the view's own loop (`animate`) already does this.
+
+a material that never reads the normal — anything flat or unlit — should say `normals: false`. a non-uniformly scaled node otherwise pays for an inverse-transpose every frame for nothing: on a 2d diagram of a few thousand quads that was 40% of encoding a frame.
+
 `bun run scene` is that example.
 
 ### shaders
@@ -198,6 +204,10 @@ it's a `CAMetalLayer` rather than an `MTKView`, so frames come from bunkit's run
 ### the annoying parts
 
 appkit runs its own nested run loop for modal dialogs, menu tracking, live resize and drags, and js is frozen the whole time it's in there. dialogs were the worst of it, so layer 3 gives you sheets instead: `alert`, `confirm`, `prompt`, `openFile` and `saveFile` all hand you a promise and the pump keeps ticking underneath. `alert` and `prompt` fall back to a blocking modal when there's no window to hang a sheet on, which is the only place `runModal` gets reached. menu tracking and live resize you just live with. they're bounded by someone letting go of the mouse.
+
+`table.rows = …` updates the table in place when every column is text: rows get added or removed at the end, and only the cells whose text changed are touched. a full `reloadData` rebuilds every visible cell through the js datasource, and on a few dozen rows refreshed ten times a second that was a 35 ms stall on the main thread every tenth pass. a table with a `render` column still reloads, and `table.reload()` is there if you want the rebuild. `table.visibleRows` says which rows are on screen, for rows that cost something to work out.
+
+setting a `Label`'s `text`, a `Button`'s `title` or any view's `hidden` to what it already is does nothing. appkit marks things for layout on every set, changed or not, and readouts refreshed twenty times a second add up.
 
 pointers are `bigint`, not `number`. apple packs short strings and small numbers into the pointer itself, which pushes the value past 2^53. compare against `0n`.
 

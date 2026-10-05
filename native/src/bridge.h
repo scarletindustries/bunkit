@@ -173,6 +173,13 @@ void br_set_stop_callback(void* js_callback);
 void br_post_empty_event(void);
 double br_now(void);
 
+// --- drawables, taken off the main thread (drawables.m) --------------------
+void* br_drawables_create(void* layer);
+void  br_drawables_arm(void* pump, int on);
+int   br_drawables_ready(void* pump);
+void* br_drawables_take(void* pump);
+void  br_drawables_destroy(void* pump);
+
 #ifdef __cplusplus
 }
 #endif

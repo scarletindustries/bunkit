@@ -59,6 +59,10 @@ export class Table<Row = any> extends View {
   #font: any;
   // Views handed to AppKit must stay reachable from JS until AppKit lets go.
   #cellViews = new Set<any>();
+  // The text each row's cells were last given, by row and then by column (in
+  // `#columns` order). Written whenever a text cell is filled, so a new set of
+  // rows can be compared against what is actually on screen.
+  #shown = new Map<number, string[]>();
 
   constructor(options: TableOptions<Row>) {
     const scroll = objc.NSScrollView.alloc().init();
@@ -180,8 +184,9 @@ export class Table<Row = any> extends View {
             }
             self.#cellViews.add(cell);
           }
-          const text = spec.value ? spec.value(data, index) : String((data as any)?.[colId] ?? "");
-          cell.textField().setStringValue_(text ?? "");
+          const text = self.#textOf(spec, data, index);
+          cell.textField().setStringValue_(text);
+          self.#remember(index, spec, text);
           return cell;
         },
 
@@ -216,14 +221,97 @@ export class Table<Row = any> extends View {
     return this.#rows;
   }
 
+  /**
+   * Replace the rows, redrawing only what changed.
+   *
+   * A table refreshed from live data — a fixture list ten times a second, a
+   * status list on every tick — mostly gets back the rows it already shows. A
+   * full `reloadData` throws every visible cell away and builds it again, and
+   * on a table of a few dozen rows that is tens of milliseconds of layout on the
+   * main thread each time. So when every column is text, rows are added or
+   * removed at the end to match the new count, and each cell AppKit is holding
+   * is given its new text only if the text differs. What the table shows is the
+   * same either way; the selection and the scroll position are kept.
+   *
+   * A table with a `render` column is reloaded in full: its cells are views the
+   * caller builds, and only the caller knows whether a new one is needed.
+   */
   set rows(v: Row[]) {
-    this.#rows = v ?? [];
-    this.reload();
+    const next = v ?? [];
+    if (this.#columns.some((c) => c.render)) {
+      this.#rows = next;
+      this.reload();
+      return;
+    }
+    // What AppKit believes the count is, not the old array's length: a caller
+    // may have mutated the array it handed over and be handing it back.
+    const before = Number(this.tableView.numberOfRows());
+    this.#rows = next;
+    const after = next.length;
+    if (after < before) {
+      this.tableView.removeRowsAtIndexes_withAnimation_(rangeSet(after, before - after), 0);
+      for (const row of this.#shown.keys()) if (row >= after) this.#shown.delete(row);
+    } else if (after > before) {
+      // The new rows' cells come from the datasource, which reads `#rows`.
+      this.tableView.insertRowsAtIndexes_withAnimation_(rangeSet(before, after - before), 0);
+    }
+    this.#refreshShown();
   }
 
+  /** Throw every cell away and rebuild what is visible. */
   reload(): void {
     this.#cellViews.clear();
+    this.#shown.clear();
     this.tableView.reloadData();
+  }
+
+  /** A cell's text, as the datasource and an in-place refresh both produce it. */
+  #textOf(spec: Column<Row>, data: Row, index: number): string {
+    const text = spec.value ? spec.value(data, index) : String((data as any)?.[spec.id] ?? "");
+    return text ?? "";
+  }
+
+  /** Record the text a cell was just given. */
+  #remember(index: number, spec: Column<Row>, text: string): void {
+    let texts = this.#shown.get(index);
+    if (!texts) {
+      texts = [];
+      this.#shown.set(index, texts);
+    }
+    texts[this.#columns.indexOf(spec)] = text;
+  }
+
+  /**
+   * Give every cell AppKit still holds the text its row now has, touching only
+   * the ones that changed.
+   *
+   * A recorded row whose cell AppKit has since recycled answers `nil` and is
+   * forgotten; when it scrolls back in, the datasource fills it from `#rows`.
+   */
+  #refreshShown(): void {
+    let columnIndex: number[] | undefined;
+    for (const [row, texts] of this.#shown) {
+      const data = this.#rows[row];
+      if (data === undefined) {
+        this.#shown.delete(row);
+        continue;
+      }
+      for (let c = 0; c < this.#columns.length; c++) {
+        const spec = this.#columns[c]!;
+        const text = this.#textOf(spec, data, row);
+        if (texts[c] === text) continue;
+        // Columns can be dragged into a new order, so ask where each one is.
+        columnIndex ??= this.#columns.map((col) => Number(this.tableView.columnWithIdentifier_(col.id)));
+        const at = columnIndex[c]!;
+        const cell = at < 0 ? null : this.tableView.viewAtColumn_row_makeIfNecessary_(at, row, false);
+        if (!cell) {
+          this.#shown.delete(row);
+          break;
+        }
+        cell.textField().setStringValue_(text);
+        texts[c] = text;
+      }
+    }
   }
 
   /** Refresh a single row without rebuilding the table. */
@@ -244,6 +332,15 @@ export class Table<Row = any> extends View {
   removeAt(index: number): void {
     this.#rows.splice(index, 1);
     this.tableView.reloadData();
+  }
+
+  /**
+   * The rows on screen now: the first one's index and how many. For a caller whose rows
+   * cost something to work out, and which only needs to work out the ones that are seen.
+   */
+  get visibleRows(): { first: number; count: number } {
+    const range = this.tableView.rowsInRect_(this.tableView.visibleRect());
+    return { first: Number(range.location), count: Number(range.length) };
   }
 
   // --- selection -----------------------------------------------------------
@@ -287,4 +384,9 @@ export class Table<Row = any> extends View {
     this.#onSelect = fn;
     return this;
   }
+}
+
+/** An `NSIndexSet` of `length` indexes from `location`. */
+function rangeSet(location: number, length: number): any {
+  return objc.NSIndexSet.indexSetWithIndexesInRange_({ location, length });
 }

@@ -66,6 +66,8 @@ export class View {
   /** @internal */ _keepAlive: any[] = [];
   /** @internal Set once `grow` has been chosen explicitly. */
   _growExplicit = false;
+  // What `hidden` was last set to through this wrapper, so setting it again is free.
+  #hiddenSet: boolean | undefined;
 
   constructor(native: any, options: ViewOptions = {}) {
     this.native = native;
@@ -239,8 +241,16 @@ export class View {
     return this.native.isHidden();
   }
 
+  /**
+   * Show or hide the view. Setting what it was last set to does nothing: a hidden
+   * view in a stack is a relayout of the stack, and code that writes its state
+   * every frame should not be paying for one every frame.
+   */
   set hidden(v: boolean) {
-    this.native.setHidden_(v);
+    const on = !!v;
+    if (on === this.#hiddenSet) return;
+    this.#hiddenSet = on;
+    this.native.setHidden_(on);
   }
 
   setBackground(color: any): this {

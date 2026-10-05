@@ -130,6 +130,12 @@ export const lib = dlopen(LIB_PATH, {
   br_should_stop: { args: [], returns: I32 },
   br_post_empty_event: { args: [], returns: V },
   br_now: { args: [], returns: F64 },
+
+  br_drawables_create: { args: [OBJ], returns: OBJ },
+  br_drawables_arm: { args: [OBJ, I32], returns: V },
+  br_drawables_ready: { args: [OBJ], returns: I32 },
+  br_drawables_take: { args: [OBJ], returns: OBJ },
+  br_drawables_destroy: { args: [OBJ], returns: V },
   br_bundle_path: { args: [], returns: CSTR },
 }).symbols;
 

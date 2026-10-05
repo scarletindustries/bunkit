@@ -109,6 +109,16 @@ export interface MaterialOptions {
   depthWrite?: boolean;
   cull?: "back" | "front" | "none";
   label?: string;
+  /**
+   * Whether the fragment reads the world-space normal. Default true — the
+   * default fragment lights with it.
+   *
+   * False for anything flat or unlit, and it is worth saying: a node with a
+   * non-uniform scale — every quad in a 2D diagram — otherwise costs an
+   * inverse-transpose per frame for a normal nothing reads. Measured on a
+   * timeline of a few thousand quads, that was 40% of each frame's encoding.
+   */
+  normals?: boolean;
 }
 
 /**
@@ -127,12 +137,15 @@ export class Material {
    * depth, so anything opaque drawn after it overwrites it completely.
    */
   readonly transparent: boolean;
+  /** Whether nodes drawn with it need a normal matrix. See `MaterialOptions.normals`. */
+  readonly normals: boolean;
   #pipelines = new Map<string, RenderPipeline>();
 
   constructor(options: MaterialOptions = {}) {
     this.options = options;
     this.label = options.label ?? "material";
     this.transparent = !!options.blend && options.blend !== "none";
+    this.normals = options.normals ?? true;
   }
 
   /** The pipeline for one set of attachment formats, compiled once. */
@@ -175,6 +188,7 @@ export function emissive(options: { intensity?: number } = {}): Material {
     depthWrite: false,
     cull: "none",
     label: "emissive",
+    normals: false,
     fragment: `
       // params.x scales per node, so one material serves a whole rig.
       float strength = ${intensity.toFixed(3)} * (params.x > 0.0 ? params.x : 1.0);
@@ -674,28 +688,31 @@ export class Scene3D extends GPUView {
       this.#reserve(batch, visible);
 
       const out = batch.floats;
+      const normals = batch.material.normals;
       let n = 0;
       let depth = 0;
       for (const node of batch.nodes) {
         if (!node.visible || n >= batch.instances.capacity) continue;
         const model = compose(node.position, node.rotation, node.scale, node._model);
-        // Under uniform scale the model matrix already carries normals in the
-        // right direction — the shader normalises, so the scale factor cancels.
-        // Only a non-uniform scale skews them, and only that needs the
-        // inverse-transpose, which is about a third of the per-node cost.
-        const { x: sx, y: sy, z: sz } = node.scale;
-        if (sx === sy && sy === sz) {
-          node._normal.set(model);
-          node._normal[12] = 0;
-          node._normal[13] = 0;
-          node._normal[14] = 0;
-        } else {
-          normalMatrix(model, node._normal);
-        }
-
         const base = n++ * SLOT.stride;
         out.set(node._model, base + SLOT.model);
-        out.set(node._normal, base + SLOT.normal);
+        // A material that never reads the normal gets whatever the slot held.
+        if (normals) {
+          // Under uniform scale the model matrix already carries normals in the
+          // right direction — the shader normalises, so the scale factor cancels.
+          // Only a non-uniform scale skews them, and only that needs the
+          // inverse-transpose, which is about a third of the per-node cost.
+          const { x: sx, y: sy, z: sz } = node.scale;
+          if (sx === sy && sy === sz) {
+            node._normal.set(model);
+            node._normal[12] = 0;
+            node._normal[13] = 0;
+            node._normal[14] = 0;
+          } else {
+            normalMatrix(model, node._normal);
+          }
+          out.set(node._normal, base + SLOT.normal);
+        }
         const c = base + SLOT.color;
         out[c] = node.color[0]; out[c + 1] = node.color[1];
         out[c + 2] = node.color[2]; out[c + 3] = node.color[3];

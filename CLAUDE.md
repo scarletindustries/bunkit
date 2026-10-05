@@ -41,3 +41,8 @@ side will even load — `dlopen` fails on a missing symbol, not at the call site
   `x.maybeThing?.()` never short-circuits.
 - **Run `test/soak.ts` after touching memory or delegate code.** Leaks here are
   linear and invisible in a short test.
+- **A wrapper holds its object until it is garbage-collected.** Usually harmless;
+  not for anything from a small pool. A `CAMetalDrawable` taken and never presented
+  stays checked out of the layer's three until its wrapper is collected, and the
+  next `nextDrawable` waits a second for it — `dispose()` it the moment it is
+  discarded (`metal/view.ts` does).

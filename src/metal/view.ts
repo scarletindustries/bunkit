@@ -21,14 +21,38 @@
 // has not caught up. That paces to the display without ever blocking the run
 // loop, which a blocking nextDrawable would.
 //
+// When a presented frame then reaches the screen is measured, not assumed,
+// from each drawable's own presentedTime — `stats.present`, see present.ts.
+//
+// One frame per refresh, drawn when the display has somewhere to put it. A
+// frame holds a drawable for three or four refreshes — rendered, queued,
+// composited, on screen until replaced — and a view that draws whenever the
+// loop comes round finds them all taken and blocks in nextDrawable until a
+// vsync frees one. Measured on a 120 Hz panel, a third of the main thread went
+// there. So the wait happens on a thread of its own (native/src/drawables.m):
+// it keeps one drawable ready, taking the next the moment the display lets go
+// of one, and wakes the run loop when it has. `frameDue` says whether one is
+// ready; a host asks before doing a frame's work, and the loop here asks before
+// drawing. A frame is then drawn exactly when the display can take it, and the
+// main thread never waits for it.
+//
+// Measured on a bare scene at 120 Hz: drawn to shown in 31.4 ms at 119 fps, and
+// no time at all in nextDrawable, where drawing whenever the loop came round
+// took 31.9 ms and waited 3.1 ms of every frame for a drawable. Two options
+// that were measured and not taken: a CAMetalDisplayLink hands over free
+// drawables too, but in a window on macOS 26 it targets five refreshes out
+// whatever its preferredFrameLatency (41 ms); and a two-drawable layer is
+// quicker to the screen (23 ms) but, with one drawable waiting for the main
+// thread, manages only 84 frames a second.
+//
 // Completion is *polled*, not delivered by a handler block, and that is not a
 // shortcut. Metal invokes addCompletedHandler: on its own thread; a JS callback
 // entered from there deadlocks Bun, because the interpreter it needs is the
 // thread that is waiting. Reading commandBuffer.status() at the top of the next
 // tick asks the same question from the thread that is allowed to ask it.
 
-import { objc, withPool } from "../objc.ts";
-import { NIL } from "../bridge.ts";
+import { objc, withPool, wrap } from "../objc.ts";
+import { lib, NIL } from "../bridge.ts";
 import { onFrame, setAnimating } from "../runtime.ts";
 import { View, type ViewOptions } from "../ui/view.ts";
 import { input, type Input } from "../ui/input.ts";
@@ -37,6 +61,7 @@ import {
   type GPU, type MTLObject, type PixelFormatName,
 } from "./gpu.ts";
 import { Frame } from "./frame.ts";
+import { PresentTracker, type PresentedDrawable, type PresentStats } from "./present.ts";
 
 export interface GPUViewOptions extends ViewOptions {
   format?: PixelFormatName;
@@ -69,6 +94,18 @@ export interface GPUViewStats {
   gpuMs: number;
   /** Ticks skipped because the GPU had not caught up. */
   skipped: number;
+  /**
+   * Frames drawn into a drawable that was already free rather than one the
+   * main thread had to wait for — see `frameDue`.
+   */
+  ready: number;
+  /**
+   * When frames actually reached the screen, from each drawable's own
+   * `presentedTime`: `present.latencyMs` is the median from a frame's handlers
+   * running to it being displayed. Zeros until the display has reported in.
+   * See present.ts.
+   */
+  present: PresentStats;
   frame: number;
   drawableSize: { width: number; height: number };
 }
@@ -101,6 +138,12 @@ export class GPUView extends View {
   #fpsFrames = 0;
   #fpsMark = 0;
   #disposed = false;
+  readonly #present = new PresentTracker();
+  /** The native thread that keeps a drawable ready. See `frameDue`. */
+  #pump: bigint | null = null;
+  /** Set once making the pump has failed; the view then waits in nextDrawable as before. */
+  #noPump = false;
+  #ready = 0;
 
   constructor(options: GPUViewOptions = {}) {
     const g = gpu();
@@ -166,8 +209,53 @@ export class GPUView extends View {
     return this;
   }
 
-  get running(): boolean {
-    return this.#stop !== null;
+  /**
+   * Whether a frame drawn now would go straight into a free drawable.
+   *
+   * Ask before doing a frame's work, and skip it when this is false: the
+   * drawable thread wakes the run loop the moment the display frees one, so the
+   * frame is only put off until the display can take it. Drawing anyway still
+   * works; it just waits in nextDrawable, on the main thread, until then.
+   *
+   * Always true for a view that is not in a window: there is no display to wait
+   * for, and the first ask after that starts the thread.
+   */
+  get frameDue(): boolean {
+    if (this.#disposed) return false;
+    const pump = this.#drawables();
+    if (pump === null) return true;
+    return lib.br_drawables_ready(pump) !== 0;
+  }
+
+  /** The drawable thread, started on first use once the view is in a window. */
+  #drawables(): bigint | null {
+    if (this.#pump !== null) return this.#pump;
+    if (this.#noPump) return null;
+    const window = this.native.window();
+    if (!window || window.ptr === NIL) return null;
+    const pump = lib.br_drawables_create(this.layer.ptr) as bigint;
+    if (!pump || pump === NIL) {
+      this.#noPump = true;
+      return null;
+    }
+    lib.br_drawables_arm(pump, 1);
+    this.#pump = pump;
+    return pump;
+  }
+
+  /** The drawable the thread has ready, or `undefined`. Ownership passes to the caller. */
+  #takeReady(): MTLObject | undefined {
+    if (this.#pump === null) return undefined;
+    const drawable = lib.br_drawables_take(this.#pump) as bigint;
+    return drawable && drawable !== NIL ? wrap(drawable, true) : undefined;
+  }
+
+  /**
+   * When frames have been reaching the screen — `stats.present` without the rest of
+   * `stats`, for a caller that asks every frame. See present.ts.
+   */
+  get present(): PresentStats {
+    return this.#present.stats;
   }
 
   get stats(): GPUViewStats {
@@ -177,13 +265,19 @@ export class GPUView extends View {
       waitMs: this.#waitMs,
       gpuMs: this.#gpuMs,
       skipped: this.#skipped,
+      ready: this.#ready,
       frame: this.#frame,
       drawableSize: { ...this.#size },
+      present: this.#present.stats,
     };
   }
 
-  /** Retire finished command buffers, and take the GPU's own timing off them. */
+  /**
+   * Retire finished command buffers, and take the GPU's own timing off them —
+   * and collect the frames the display has shown since.
+   */
   #reap(): number {
+    if (this.#present.pending > 0) this.#present.poll(lib.br_now() * 1000);
     let i = 0;
     while (i < this.#inFlight.length) {
       const buffer = this.#inFlight[i]!;
@@ -211,6 +305,7 @@ export class GPUView extends View {
       this.#skipped++;
       return;
     }
+    if (!this.frameDue) return;
     const dt = now - this.#last;
     this.#last = now;
     this.draw(now - this.#start, dt);
@@ -256,9 +351,11 @@ export class GPUView extends View {
   }
 
   /**
-   * Encode and present one frame.
+   * Encode and present one frame, now.
    *
-   * Call it directly for a single still; the loop calls it otherwise.
+   * Into the drawable the drawable thread has ready when there is one (see
+   * `frameDue`); otherwise into the next the layer gives up, which waits until
+   * the display frees one. Call it directly for a single still.
    */
   draw(time = 0, dt = 0): void {
     if (this.#disposed || this.#handlers.length === 0) return;
@@ -268,20 +365,40 @@ export class GPUView extends View {
     this.#reap();
     const cpuStart = performance.now();
     let waited = 0;
+    let drawn = false;
 
     withPool(() => {
       const { width, height } = this.#syncSize();
       if (width < 2 || height < 2) return;
 
-      // nextDrawable blocks when every drawable is still on screen or in
-      // flight. That is the display pacing us, not work, so it is timed apart.
-      const waitStart = performance.now();
-      const drawable = this.layer.nextDrawable();
-      waited = performance.now() - waitStart;
-      if (!drawable || drawable.ptr === NIL) return;
+      let drawable = this.#takeReady();
+      if (drawable) {
+        // Taken before a resize: the wrong size for the attachments now.
+        const texture = drawable.texture();
+        if (Number(texture.width()) !== width || Number(texture.height()) !== height) {
+          // Released now, not when the wrapper is collected: a drawable that is never
+          // presented stays checked out of the layer's three until it is let go, and
+          // the next nextDrawable would wait a whole second for it.
+          drawable.dispose();
+          drawable = undefined;
+        } else {
+          this.#ready++;
+        }
+      }
+      if (!drawable) {
+        // nextDrawable blocks when every drawable is still on screen or in
+        // flight. That is the display pacing us, not work, so it is timed apart.
+        const waitStart = performance.now();
+        drawable = this.layer.nextDrawable();
+        waited = performance.now() - waitStart;
+        if (!drawable || drawable.ptr === NIL) return;
+      }
 
       const commands = this.gpu.queue.commandBuffer();
       commands.setLabel_(`frame ${this.#frame}`);
+      // The moment the handlers read whatever they draw — what the frame's
+      // latency to the screen is measured from.
+      const drawnMs = lib.br_now() * 1000;
 
       const frame = new Frame(commands, {
         time, dt, index: this.#frame, width, height,
@@ -301,11 +418,14 @@ export class GPUView extends View {
 
       commands.presentDrawable_(drawable);
       commands.commit();
+      this.#present.track(drawable as PresentedDrawable, drawnMs);
       // Retained past the pool: #reap polls its status on a later tick.
       this.#inFlight.push(commands.retain());
       this.#frame++;
+      drawn = true;
     });
 
+    if (!drawn) return;
     this.#waitMs = waited;
     this.#cpuMs = performance.now() - cpuStart - waited;
     this.#fpsFrames++;
@@ -372,6 +492,11 @@ export class GPUView extends View {
     this.#disposed = true;
     for (const buffer of this.#inFlight) buffer.release();
     this.#inFlight = [];
+    this.#present.dispose();
+    if (this.#pump !== null) {
+      lib.br_drawables_destroy(this.#pump);
+      this.#pump = null;
+    }
     this.depthTexture = null;
     this.msaaTexture = null;
   }

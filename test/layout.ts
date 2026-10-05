@@ -168,6 +168,88 @@ const H = 500;
 }
 
 // ---------------------------------------------------------------------------
+// 4b. New rows on a text table are drawn in place: the same cells, new text
+// ---------------------------------------------------------------------------
+{
+  type Row = { a: string; n: number };
+  const table = new Table<Row>({
+    columns: [
+      { id: "a", title: "A", width: 160 },
+      { id: "n", title: "N", width: 80, value: (r) => `#${r.n}` },
+    ],
+    rows: [
+      { a: "one", n: 1 },
+      { a: "two", n: 2 },
+      { a: "three", n: 3 },
+    ],
+    grow: 1,
+  });
+  const stack = new VStack({ spacing: 10, padding: 16 }, [table]);
+  const w = new Window({ title: "table rows", size: { width: W, height: H }, content: stack, show: true });
+  settle(w);
+
+  const tv = table.tableView;
+  const cell = (col: number, row: number) => tv.viewAtColumn_row_makeIfNecessary_(col, row, false);
+  const text = (col: number, row: number) => String(cell(col, row)?.textField().stringValue() ?? "");
+  const before = cell(0, 1);
+  check("a text table fills its cells", text(0, 1) === "two" && text(1, 2) === "#3", `${text(0, 1)} ${text(1, 2)}`);
+
+  table.select(1);
+  table.rows = [
+    { a: "one", n: 1 },
+    { a: "TWO", n: 2 },
+    { a: "three", n: 30 },
+  ];
+  settle(w, 4);
+  check("changed text is drawn", text(0, 1) === "TWO" && text(1, 2) === "#30", `${text(0, 1)} ${text(1, 2)}`);
+  check("…into the same cell, not a rebuilt one", cell(0, 1)?.ptr === before?.ptr);
+  check("…and the selection is kept", table.selectedIndex === 1, table.selectedIndex);
+
+  table.rows = [...table.rows, { a: "four", n: 4 }, { a: "five", n: 5 }];
+  settle(w, 4);
+  check("more rows are added", Number(tv.numberOfRows()) === 5 && text(0, 4) === "five",
+    `${tv.numberOfRows()} ${text(0, 4)}`);
+  table.rows = [{ a: "only", n: 9 }];
+  settle(w, 4);
+  check("fewer rows are removed", Number(tv.numberOfRows()) === 1 && text(0, 0) === "only",
+    `${tv.numberOfRows()} ${text(0, 0)}`);
+  check("the visible rows are the ones on screen", table.visibleRows.first === 0 && table.visibleRows.count === 1,
+    JSON.stringify(table.visibleRows));
+
+  // A caller that mutates the array it handed over and hands it back is still drawn.
+  const rows = table.rows;
+  rows.push({ a: "pushed", n: 10 });
+  table.rows = rows;
+  settle(w, 4);
+  check("a mutated array handed back is drawn", Number(tv.numberOfRows()) === 2 && text(1, 1) === "#10",
+    `${tv.numberOfRows()} ${text(1, 1)}`);
+  w.close();
+}
+
+// ---------------------------------------------------------------------------
+// 4c. Setting what is already there is free, and setting something new still lands
+// ---------------------------------------------------------------------------
+{
+  const label = new Label({ text: "one" });
+  const button = new Button({ title: "Play" });
+  const w = new Window({ title: "setters", size: { width: 300, height: 120 },
+    content: new VStack({ padding: 8 }, [label, button]), show: false });
+  label.text = "one";
+  label.text = "two";
+  label.text = "two";
+  check("a label shows the last text set", label.text === "two", label.text);
+  button.title = "Pause";
+  button.title = "Pause";
+  check("a button shows the last title set", button.title === "Pause", button.title);
+  label.hidden = true;
+  label.hidden = true;
+  check("hidden takes", label.hidden === true);
+  label.hidden = false;
+  check("and comes back", label.hidden === false);
+  w.close();
+}
+
+// ---------------------------------------------------------------------------
 // 5. The full demo layout, in miniature
 // ---------------------------------------------------------------------------
 {

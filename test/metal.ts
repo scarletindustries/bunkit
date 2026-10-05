@@ -29,6 +29,13 @@ import {
   v3normalize,
   Vertex,
   VERTEX_STRIDE,
+  PresentTracker,
+  DROP_AFTER_MS,
+  ASSUMED_LATENCY_MS,
+  MIN_PRESENT_SAMPLES,
+  screenLatencyMs,
+  material,
+  emissive,
 } from "../src/metal/index.ts";
 import { HStack, VStack, Window } from "../src/ui/index.ts";
 import { initApp, pumpOnce } from "../src/runtime.ts";
@@ -283,6 +290,27 @@ if (!gpuAvailable()) {
     s.start();
     for (let i = 0; i < 40; i++) pumpOnce(0.006);
     check("the run loop drives frames", frames > 3, frames);
+    // Let the display report in, then ask when the frames reached it.
+    for (let i = 0; i < 40 && s.stats.present.samples === 0; i++) pumpOnce(0.006);
+    const present = s.stats.present;
+    check("presented frames report when they reached the screen", present.samples > 0, JSON.stringify(present));
+    check("…a plausible latency", present.latencyMs > 0 && present.latencyMs < DROP_AFTER_MS,
+      present.latencyMs);
+    // The animated loop only draws when the drawable thread has one free, so it never
+    // waits in nextDrawable on the main thread.
+    check("animated frames are drawn into drawables that were already free",
+      s.stats.ready > 0 && s.stats.waitMs === 0, JSON.stringify({ ready: s.stats.ready, waitMs: s.stats.waitMs }));
+
+    // A resize makes the drawable the thread holds the wrong size. It has to be let go at
+    // once: held until the wrapper is collected, it starves the layer and the next frame
+    // waits a whole second for a drawable.
+    win.native.setContentSize_({ width: 520, height: 360 });
+    const resizedAt = performance.now();
+    const before = frames;
+    for (let i = 0; i < 30; i++) pumpOnce(0.004);
+    const took = performance.now() - resizedAt;
+    check("frames carry on straight after a resize", frames > before + 3 && took < 800,
+      `${frames - before} frames in ${took.toFixed(0)} ms`);
     s.stop();
     const stopped = frames;
     for (let i = 0; i < 20; i++) pumpOnce(0.004);
@@ -291,6 +319,68 @@ if (!gpuAvailable()) {
     s.dispose();
     win.close();
   }
+}
+
+// ---------------------------------------------------------------------------
+// A material that reads no normal is spared the normal matrix, and still draws
+// ---------------------------------------------------------------------------
+{
+  check("materials read normals unless they say not", material({}).normals === true);
+  check("emissive() says it does not", emissive().normals === false);
+  if (gpuAvailable()) {
+    const flat = material({ normals: false, fragment: "return float4(in.color.rgb, 1.0);" });
+    const s = new Scene3D({ background: "#000000", animate: false });
+    s.camera.position = { x: 0, y: 0, z: 5 };
+    s.camera.target = { x: 0, y: 0, z: 0 };
+    // Non-uniformly scaled: the case that would otherwise pay for an inverse-transpose.
+    s.add(box({ size: [3, 1, 0.1], color: "#00ff00", material: flat }));
+    const px = s.capture(64, 64).pixels;
+    const at = (32 * 64 + 32) * 4;
+    check("a normal-free material still draws its colour", px[at + 1]! > 200, [...px.slice(at, at + 4)]);
+    s.dispose();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// When frames reach the screen: the tracker, against fake drawables
+// ---------------------------------------------------------------------------
+{
+  /** A drawable the test controls: shown at `at` seconds, or never. */
+  const fake = () => {
+    const d = { at: 0, retains: 0, releases: 0,
+      presentedTime: () => d.at, retain: () => d.retains++, release: () => d.releases++ };
+    return d;
+  };
+  const t = new PresentTracker();
+  const a = fake(), b = fake(), c = fake();
+  t.track(a, 1_000);
+  t.track(b, 1_008);
+  t.track(c, 1_016);
+  check("a tracked drawable is retained", a.retains === 1 && t.pending === 3);
+  t.poll(1_010);
+  check("nothing reported: nothing measured", t.stats.samples === 0 && t.pending === 3);
+
+  a.at = 1.030; // shown 30 ms after it was drawn
+  b.at = 1.040; // 32 ms, one 10 ms refresh later
+  t.poll(1_041);
+  const s = t.stats;
+  check("reported frames are measured and let go",
+    s.samples === 2 && a.releases === 1 && b.releases === 1 && t.pending === 1, JSON.stringify(s));
+  check("latency is shown minus drawn", Math.abs(s.latencyMs - 30) < 1e-6 && Math.abs(s.latencyP95Ms - 30) < 1e-6,
+    JSON.stringify(s));
+  check("refresh is the gap between presentations", Math.abs(s.refreshMs - 10) < 1e-6, s.refreshMs);
+
+  t.poll(1_016 + DROP_AFTER_MS + 1);
+  check("a frame never shown is dropped, and let go", t.stats.dropped === 1 && c.releases === 1 && t.pending === 0);
+
+  const d = fake();
+  t.track(d, 2_000);
+  t.dispose();
+  check("dispose releases what is still held", d.releases === 1 && t.pending === 0);
+
+  check("before enough frames, the latency is assumed",
+    screenLatencyMs({ samples: MIN_PRESENT_SAMPLES - 1, latencyMs: 12 }) === ASSUMED_LATENCY_MS);
+  check("after, it is measured", screenLatencyMs({ samples: MIN_PRESENT_SAMPLES, latencyMs: 12 }) === 12);
 }
 
 console.log(failures === 0 ? "\nALL METAL TESTS PASSED" : `\n${failures} METAL FAILURE(S)`);

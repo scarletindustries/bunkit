@@ -15,6 +15,7 @@ export * from "./shaders.ts";
 export * from "./post.ts";
 export * from "./frame.ts";
 export * from "./view.ts";
+export * from "./present.ts";
 export * from "./math.ts";
 export * from "./geometry.ts";
 export * from "./scene.ts";
