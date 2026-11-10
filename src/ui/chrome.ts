@@ -183,6 +183,8 @@ export class ToolbarItem {
   #enabled = true;
   #hidden = false;
   #tooltip: string | undefined;
+  /** A pick-one group's selected segment as last set, or -1. */
+  #picked = -1;
 
   /** @internal */
   constructor(native: any, spec: ToolbarItemSpec) {
@@ -288,9 +290,21 @@ export class ToolbarItem {
     return this.spec.segments.map((_, i) => Boolean(this.native.isSelectedAtIndex_(i)));
   }
 
-  /** Select or deselect one segment of a group. */
+  /**
+   * Select or deselect one segment of a group. A pick-one group is told its selected index —
+   * AppKit draws the selection from that, not from the per-segment flag.
+   */
   select(index: number, on = true): void {
     if (this.spec.kind !== "group") return;
+    if (this.spec.selection === "one") {
+      // Tracked here rather than read back: before the group is drawn AppKit answers 0 for its
+      // selected index whether or not segment 0 has been drawn as selected.
+      if (on && this.#picked !== index) {
+        this.#picked = index;
+        this.native.setSelectedIndex_(index);
+      }
+      return;
+    }
     if (Boolean(this.native.isSelectedAtIndex_(index)) === on) return;
     this.native.setSelected_atIndex_(on, index);
   }
@@ -327,6 +341,9 @@ export class ToolbarItem {
     if (this.spec.kind === "button") this.spec.onClick?.();
     else if (this.spec.kind === "group") {
       if (this.spec.selection === "one") this.select(index, true);
+      else if (this.spec.selection === "momentary") {
+        // A button press: nothing stays selected.
+      }
       else if (this.spec.selection === "any") this.select(index, !this.selected[index]);
       this.spec.onSelect?.(index, this.selected);
     }
@@ -419,6 +436,8 @@ export class Toolbar {
       const target = actionTarget(() => {
         if (!handle || spec.kind !== "group") return;
         const index = Number(handle.native.selectedIndex());
+        // A click moved the selection without going through `select`; record it there.
+        if (spec.selection === "one") handle.select(index, true);
         spec.onSelect?.(index, handle.selected);
       });
       this.#keep.push(target);
@@ -551,11 +570,18 @@ export class SplitLayout {
     return this.#content;
   }
 
-  /** Show something else in the content pane — a different mode. The old view is kept alive by the caller. */
-  setContent(view: View): void {
+  /**
+   * Show something else in the content pane — a different mode. The old view is kept alive by
+   * the caller.
+   *
+   * @param safeArea keep the view to the pane's safe area — below the toolbar and the strip —
+   *   rather than running under them. For content that draws something of its own at its very
+   *   top, like a timeline's ruler; a picture or a 3D room can run under the glass.
+   */
+  setContent(view: View, options: { safeArea?: boolean } = {}): void {
     if (view === this.#content) return;
     this.#content.removeFromParent();
-    place(this.contentHost, view, false);
+    place(this.contentHost, view, options.safeArea ?? false);
     this.#content = view;
   }
 

@@ -17,6 +17,7 @@ export * from "./input.ts";
 export * from "./app.ts";
 export * from "./snapshot.ts";
 export * from "./chrome.ts";
+export * from "./form.ts";
 
 // Metal. Scene3D is a View, so it belongs with the rest of the layout classes.
 export * from "../metal/index.ts";

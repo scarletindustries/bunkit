@@ -77,7 +77,7 @@ three layers sit on top:
 
 | | | |
 |---|---|---|
-| `src/ui/` | layer 3 | `Window`, `VStack`, `Button`, `Table`, `Toolbar`, `SplitLayout`, 32 classes |
+| `src/ui/` | layer 3 | `Window`, `VStack`, `Button`, `Table`, `Toolbar`, `SplitLayout`, `formSection`, 32 classes |
 | `src/objc.ts` | layer 2 | `objc.NSWindow.alloc().init…()`, marshalling, delegates, blocks |
 | `src/bridge.ts` | layer 1 | dlopen, packing arguments into buffers |
 
@@ -89,7 +89,7 @@ the encoding reader, the dispatcher, the closure trampolines, the memory model a
 
 ### window chrome
 
-macos 26 draws its own liquid glass, and every piece of it is reachable from here. `Toolbar` builds an `NSToolbar` from a list (buttons, groups of toggles or pickers, any view, and appkit's own spaces and tracking separators) and hands back a handle per item, so a button can turn prominent and red while it is live or carry a badge. `SplitLayout` is an `NSSplitViewController` with a floating sidebar, the content, and an inspector; the content runs under the toolbar and the inspector, and a strip can be pinned to its top. `GlassView` puts one view on liquid glass, `Popover` opens one next to a toolbar item, and `symbol()` / `SymbolView` are sf symbols.
+macos 26 draws its own liquid glass, and every piece of it is reachable from here. `Toolbar` builds an `NSToolbar` from a list (buttons, groups of toggles or pickers, any view, and appkit's own spaces and tracking separators) and hands back a handle per item, so a button can turn prominent and red while it is live or carry a badge. `SplitLayout` is an `NSSplitViewController` with a floating sidebar, the content, and an inspector; the content runs under the toolbar and the inspector, and a strip can be pinned to its top. `GlassView` puts one view on liquid glass, `Popover` opens one next to a toolbar item, and `symbol()` / `SymbolView` are sf symbols. `formSection()` lays out a settings window the way system settings does — titled, rounded groups of rows with a footnote — and gives every bit of running text a width to wrap at.
 
 ```ts
 const toolbar = new Toolbar({

@@ -36,6 +36,11 @@ export interface FontSpec {
   size?: number;
   weight?: number | FontWeightName;
   monospace?: boolean;
+  /**
+   * The system font with fixed-width **digits** only — for a clock or a column of numbers that
+   * must not jitter as it changes, in a line that is otherwise ordinary text.
+   */
+  digits?: boolean;
   /** Use the system font at a semantic size instead of a point size. */
   style?: "body" | "title" | "headline" | "caption" | "largeTitle";
 }
@@ -67,6 +72,7 @@ export function makeFont(spec: FontSpec | number | undefined): any {
   const weight =
     typeof spec.weight === "string" ? WEIGHTS[spec.weight] : (spec.weight ?? FontWeight.Regular);
   if (spec.monospace) return objc.NSFont.monospacedSystemFontOfSize_weight_(size, weight);
+  if (spec.digits) return objc.NSFont.monospacedDigitSystemFontOfSize_weight_(size, weight);
   return objc.NSFont.systemFontOfSize_weight_(size, weight);
 }
 

@@ -15,6 +15,9 @@ import {
   Toolbar,
   VStack,
   Window,
+  formNote,
+  formSection,
+  makeFont,
   symbol,
 } from "../src/ui/index.ts";
 import { pumpOnce } from "../src/runtime.ts";
@@ -229,6 +232,23 @@ check("a song can", Boolean(delegate.tableView_shouldSelectRow_(table.tableView,
 check("rows take their own heights", Math.abs(Number(table.tableView.rectOfRow_(2).height) - 48) < 1, table.tableView.rectOfRow_(2));
 
 win.close();
+console.log("forms");
+const section = formSection({
+  title: "Audio",
+  rows: [
+    { label: "Output", controls: [new Label({ text: "System default" })], note: "the interface" },
+    { controls: [new Label({ text: "a row of controls" })] },
+  ],
+  footer: "Every wrapping label in a form has a width, so the window is not as wide as the sentence.",
+});
+const [title, group, footer] = section.children as [Label, VStack, Label];
+check("a section is its title, its group and its footer", section.children.length === 3);
+check("the title is in title case, as given", title.text === "Audio");
+check("rows are separated by a hairline", group.children.length === 3);
+check("the footer wraps at a width", Number(footer.native.preferredMaxLayoutWidth()) > 0);
+check("a note does too", Number(formNote("x", 300).native.preferredMaxLayoutWidth()) === 300);
+check("fixed-width digits are a font", makeFont({ size: 11, digits: true }) !== null);
+
 if (failures > 0) {
   console.log(`${failures} failure(s)`);
   process.exit(1);
