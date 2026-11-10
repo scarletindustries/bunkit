@@ -11,6 +11,7 @@
 // ordinary heap addresses and stay plain numbers.
 
 import { dlopen, FFIType, JSCallback, ptr, suffix, toArrayBuffer, CString } from "bun:ffi";
+import type { Pointer } from "bun:ffi";
 import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,8 +23,12 @@ export const NIL: Ptr = 0n;
 /**
  * bun:ffi types a raw address as an opaque brand, but at runtime it is a plain
  * number. This is the one place that conversion is spelled out.
+ *
+ * The brand itself, not a parameter type borrowed from a bun:ffi function:
+ * `toArrayBuffer` now also takes `number | bigint`, and a `ptr` argument does
+ * not take a bare `number`, so the borrowed type stopped fitting the calls.
  */
-export type BunPointer = Parameters<typeof toArrayBuffer>[0];
+export type BunPointer = Pointer;
 export function asPointer(addr: number | bigint): BunPointer {
   return (typeof addr === "bigint" ? Number(addr) : addr) as unknown as BunPointer;
 }
