@@ -144,6 +144,7 @@ export const BezelStyle = pick({
   Recessed: "NSBezelStyleRecessed",
   RoundedDisclosure: "NSBezelStyleRoundedDisclosure",
   Inline: "NSBezelStyleInline",
+  Glass: "NSBezelStyleGlass",
 });
 
 export const ButtonType = pick({
@@ -170,6 +171,7 @@ export const ControlSize = pick({
   Small: "NSControlSizeSmall",
   Mini: "NSControlSizeMini",
   Large: "NSControlSizeLarge",
+  ExtraLarge: "NSControlSizeExtraLarge",
 });
 
 export const ImageScaling = pick({
@@ -187,6 +189,8 @@ export const ImagePosition = pick({
   ImageBelow: "NSImageBelow",
   ImageAbove: "NSImageAbove",
   ImageOverlaps: "NSImageOverlaps",
+  ImageLeading: "NSImageLeading",
+  ImageTrailing: "NSImageTrailing",
 });
 
 export const TableViewStyle = pick({

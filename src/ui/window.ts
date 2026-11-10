@@ -37,6 +37,15 @@ export interface WindowOptions {
   onFocus?: (w: Window) => void;
   onBlur?: (w: Window) => void;
   content?: View;
+  /** A second line under the title (macOS 11+): the window's state, in a few words. */
+  subtitle?: string;
+  /**
+   * How the title bar and toolbar share the top of the window. `"unified"` puts the title
+   * inline with a toolbar; `"expanded"` gives the title a row of its own.
+   */
+  toolbarStyle?: "automatic" | "expanded" | "unified" | "unifiedCompact";
+  /** Force an appearance; omitted, the window follows the system. */
+  appearance?: "dark" | "light";
   /** Show the window as soon as it is constructed. Default true. */
   show?: boolean;
 }
@@ -77,6 +86,17 @@ export class Window {
     this.native.setReleasedWhenClosed_(false);
 
     if (options.title !== undefined) this.native.setTitle_(options.title);
+    if (options.subtitle !== undefined) this.native.setSubtitle_(options.subtitle);
+    if (options.toolbarStyle !== undefined) {
+      this.native.setToolbarStyle_(
+        { automatic: 0, expanded: 1, unified: 3, unifiedCompact: 4 }[options.toolbarStyle],
+      );
+    }
+    if (options.appearance !== undefined) {
+      this.native.setAppearance_(objc.NSAppearance.appearanceNamed_(
+        options.appearance === "dark" ? "NSAppearanceNameDarkAqua" : "NSAppearanceNameAqua",
+      ));
+    }
     if (options.minSize) this.native.setMinSize_(options.minSize);
     if (options.maxSize) this.native.setMaxSize_(options.maxSize);
     if (options.fullSizeContent) {
@@ -129,6 +149,19 @@ export class Window {
     );
     this.native.setDelegate_(this.#delegate);
   }
+
+  // --- title -------------------------------------------------------------------
+
+  /** The second line under the title. Writing the same text again does nothing. */
+  get subtitle(): string {
+    return str(this.native.subtitle());
+  }
+  set subtitle(text: string) {
+    if (text === this.#subtitle) return;
+    this.#subtitle = text;
+    this.native.setSubtitle_(text);
+  }
+  #subtitle: string | undefined;
 
   // --- content -------------------------------------------------------------
 

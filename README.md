@@ -77,7 +77,7 @@ three layers sit on top:
 
 | | | |
 |---|---|---|
-| `src/ui/` | layer 3 | `Window`, `VStack`, `Button`, `Table`, 26 classes |
+| `src/ui/` | layer 3 | `Window`, `VStack`, `Button`, `Table`, `Toolbar`, `SplitLayout`, 32 classes |
 | `src/objc.ts` | layer 2 | `objc.NSWindow.alloc().init…()`, marshalling, delegates, blocks |
 | `src/bridge.ts` | layer 1 | dlopen, packing arguments into buffers |
 
@@ -86,6 +86,29 @@ layer 3 is the pleasant one. when it doesn't cover what you need you drop to lay
 it goes through libffi instead of using `bun:ffi` on its own because `bun:ffi` wants the signature up front at dlopen time. it can't build one at runtime, can't pass a struct by value, and can't make a function pointer with an arbitrary signature. all three of those are needed here.
 
 the encoding reader, the dispatcher, the closure trampolines, the memory model and the pump are all written up in [the bridge](https://scarlet.industries/docs/bunkit/bridge).
+
+### window chrome
+
+macos 26 draws its own liquid glass, and every piece of it is reachable from here. `Toolbar` builds an `NSToolbar` from a list (buttons, groups of toggles or pickers, any view, and appkit's own spaces and tracking separators) and hands back a handle per item, so a button can turn prominent and red while it is live or carry a badge. `SplitLayout` is an `NSSplitViewController` with a floating sidebar, the content, and an inspector; the content runs under the toolbar and the inspector, and a strip can be pinned to its top. `GlassView` puts one view on liquid glass, `Popover` opens one next to a toolbar item, and `symbol()` / `SymbolView` are sf symbols.
+
+```ts
+const toolbar = new Toolbar({
+  id: "main",
+  items: [
+    "toggleSidebar", "sidebarSeparator",
+    { kind: "group", id: "transport", label: "Transport", selection: "momentary",
+      segments: [{ symbol: "play.fill", label: "Play" }, { symbol: "stop.fill", label: "Stop" }] },
+    "flexibleSpace",
+    { kind: "button", id: "live", label: "Live", title: "Live", onClick: goLive },
+    "inspectorSeparator", "toggleInspector",
+  ],
+});
+const split = new SplitLayout({ sidebar: { view: list }, content: scene, inspector: { view: details } });
+const win = new Window({ title: "Show", toolbarStyle: "unified", fullSizeContent: true });
+toolbar.attach(win);
+split.attach(win);
+toolbar.item("live").prominent = true;
+```
 
 ### 3d
 

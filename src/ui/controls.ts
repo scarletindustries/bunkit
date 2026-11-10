@@ -4,6 +4,7 @@
 // delegate and target/action machinery stays out of sight in Layer 2.
 
 import { createDelegate, objc, str } from "../objc.ts";
+import * as C from "../generated/constants.ts";
 import { ACTION_SELECTOR, actionTarget, toNSColor, View, type ViewOptions } from "./view.ts";
 import {
   AutoresizingMask,
@@ -147,6 +148,20 @@ export class Label extends View {
 // Button
 // ---------------------------------------------------------------------------
 
+const PROMINENCE = {
+  automatic: C.NSTintProminenceAutomatic,
+  none: C.NSTintProminenceNone,
+  primary: C.NSTintProminencePrimary,
+  secondary: C.NSTintProminenceSecondary,
+} as const;
+
+const SHAPES = {
+  automatic: C.NSControlBorderShapeAutomatic,
+  capsule: C.NSControlBorderShapeCapsule,
+  circle: C.NSControlBorderShapeCircle,
+  roundedRectangle: C.NSControlBorderShapeRoundedRectangle,
+} as const;
+
 export interface ButtonOptions extends ViewOptions {
   title?: string;
   onClick?: (button: Button) => void;
@@ -160,6 +175,17 @@ export interface ButtonOptions extends ViewOptions {
   size?: number;
   key?: string;
   bordered?: boolean;
+  /** Liquid Glass (macOS 26): for a button that floats over content. */
+  glass?: boolean;
+  /**
+   * How strongly the button is tinted (macOS 26). `"primary"` is the one action the view is
+   * for; `"secondary"` tints without competing with it.
+   */
+  prominence?: "automatic" | "none" | "primary" | "secondary";
+  /** The bezel's colour — with `prominence: "primary"`, the colour of the whole button. */
+  tint?: any;
+  /** The bezel's shape (macOS 26). */
+  shape?: "automatic" | "capsule" | "circle" | "roundedRectangle";
 }
 
 export class Button extends View {
@@ -182,6 +208,10 @@ export class Button extends View {
       }
     }
     if (options.bezel !== undefined) b.setBezelStyle_(options.bezel);
+    if (options.glass) b.setBezelStyle_(BezelStyle.Glass);
+    if (options.prominence !== undefined) b.setTintProminence_(PROMINENCE[options.prominence]);
+    if (options.tint !== undefined) b.setBezelColor_(toNSColor(options.tint));
+    if (options.shape !== undefined) b.setBorderShape_(SHAPES[options.shape]);
     if (options.size !== undefined) b.setControlSize_(options.size);
     if (options.bordered !== undefined) b.setBordered_(options.bordered);
     if (options.enabled !== undefined) b.setEnabled_(options.enabled);
@@ -206,6 +236,25 @@ export class Button extends View {
   /** Fire the button's action as though the user clicked it. */
   click(): void {
     this.native.performClick_(null);
+  }
+
+  /** Re-tint the bezel; `null` for none. */
+  set tint(color: any) {
+    this.native.setBezelColor_(toNSColor(color));
+  }
+
+  /** Change how strongly it is tinted. */
+  set prominence(p: "automatic" | "none" | "primary" | "secondary") {
+    this.native.setTintProminence_(PROMINENCE[p]);
+  }
+
+  /** Show an SF Symbol, or none. */
+  set symbol(name: string | undefined) {
+    const img = name ? objc.NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, name) : null;
+    this.native.setImage_(img);
+    this.native.setImagePosition_(
+      !img ? ImagePosition.NoImage : this.title ? ImagePosition.ImageLeading : ImagePosition.ImageOnly,
+    );
   }
 
   get title(): string {

@@ -46,6 +46,15 @@ export interface TableOptions<Row = any> extends ViewOptions {
   alternatingRows?: boolean;
   multiSelect?: boolean;
   font?: FontSpec | number;
+  /**
+   * Rows drawn as section headers: no selection, the source list's header style. Asked of
+   * every row, so keep it cheap.
+   */
+  isGroup?: (row: Row, index: number) => boolean;
+  /** A row's height, when rows differ. Call {@link Table.noteHeightChanged} when one does. */
+  heightOf?: (row: Row, index: number) => number;
+  /** Whether a row may be selected. Group rows never are. */
+  selectable?: (row: Row, index: number) => boolean;
 }
 
 export class Table<Row = any> extends View {
@@ -57,6 +66,7 @@ export class Table<Row = any> extends View {
   #onSelect?: (row: Row | null, index: number) => void;
   #onDoubleClick?: (row: Row, index: number) => void;
   #font: any;
+  readonly #options: TableOptions<Row>;
   // Views handed to AppKit must stay reachable from JS until AppKit lets go.
   #cellViews = new Set<any>();
   // The text each row's cells were last given, by row and then by column (in
@@ -89,6 +99,7 @@ export class Table<Row = any> extends View {
     }
     this.scrollView = scroll;
     this.tableView = tv;
+    this.#options = options;
     this.#columns = options.columns;
     this.#rows = options.rows ?? [];
     this.#onSelect = options.onSelect;
@@ -134,7 +145,9 @@ export class Table<Row = any> extends View {
         // View-based tables: return a configured NSView for the cell. AppKit
         // recycles views through makeViewWithIdentifier:owner:.
         "tableView:viewForTableColumn:row:": (_tv: any, column: any, row: number) => {
-          const colId = str(column.identifier());
+          // A group row spans the table, and AppKit asks for it with no column: it is
+          // drawn by the first one.
+          const colId = column ? str(column.identifier()) : self.#columns[0]!.id;
           const spec = self.#columns.find((c) => c.id === colId);
           const index = Number(row);
           const data = self.#rows[index];
@@ -194,6 +207,34 @@ export class Table<Row = any> extends View {
           const i = self.selectedIndex;
           self.#onSelect?.(i >= 0 ? (self.#rows[i] ?? null) : null, i);
         },
+        // Only the selectors the options ask for: an Obj-C class is one per shape, and a
+        // table with no group rows should not pay a call per row to say so.
+        ...(this.#options.isGroup
+          ? {
+              "tableView:isGroupRow:": (_tv: any, row: number) => {
+                const data = self.#rows[Number(row)];
+                return data !== undefined && self.#options.isGroup!(data, Number(row));
+              },
+            }
+          : {}),
+        ...(this.#options.heightOf
+          ? {
+              "tableView:heightOfRow:": (_tv: any, row: number) => {
+                const data = self.#rows[Number(row)];
+                return data === undefined ? 24 : self.#options.heightOf!(data, Number(row));
+              },
+            }
+          : {}),
+        ...(this.#options.isGroup || this.#options.selectable
+          ? {
+              "tableView:shouldSelectRow:": (_tv: any, row: number) => {
+                const data = self.#rows[Number(row)];
+                if (data === undefined) return false;
+                if (self.#options.isGroup?.(data, Number(row))) return false;
+                return self.#options.selectable?.(data, Number(row)) ?? true;
+              },
+            }
+          : {}),
       },
       {
         protocols: ["NSTableViewDataSource", "NSTableViewDelegate"],
@@ -312,6 +353,11 @@ export class Table<Row = any> extends View {
         texts[c] = text;
       }
     }
+  }
+
+  /** Tell the table one row's {@link TableOptions.heightOf} has changed. Animates. */
+  noteHeightChanged(index: number): void {
+    this.tableView.noteHeightOfRowsWithIndexesChanged_(objc.NSIndexSet.indexSetWithIndex_(index));
   }
 
   /** Refresh a single row without rebuilding the table. */
