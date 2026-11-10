@@ -81,6 +81,10 @@ export class Table<Row = any> extends View {
     scroll.setAutohidesScrollers_(true);
     scroll.setBorderType_(BorderType.None);
     scroll.setDrawsBackground_(false);
+    // Insets come from the layout, never from AppKit guessing: in a full-size-content window
+    // a scroll view otherwise insets itself by the toolbar's height, on top of a pane that
+    // already keeps to its safe area, and its first rows start scrolled out of sight.
+    scroll.setAutomaticallyAdjustsContentInsets_(false);
 
     const tv = objc.NSTableView.alloc().init();
     tv.setStyle_(TableViewStyle[options.style ?? "Inset"]);

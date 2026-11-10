@@ -8,6 +8,7 @@ import {
   GlassView,
   Label,
   Popover,
+  ScrollView,
   SplitLayout,
   SymbolView,
   Table,
@@ -168,6 +169,22 @@ check("the inspector collapses", split.inspectorCollapsed);
 split.inspectorCollapsed = false;
 pump(60);
 check("and comes back", !split.inspectorCollapsed);
+
+console.log("content beside the panes");
+const beside = new SplitLayout({ content: new Container(), inspector: { view: new Label({ text: "i" }), min: 300, max: 300 }, contentUnderPanes: false });
+const win2 = new Window({ title: "Beside", fullSizeContent: true, toolbarStyle: "unified", size: { width: 1000, height: 500 } });
+beside.attach(win2);
+pump();
+const besideWidth = Number(beside.contentHost.native.frame().width);
+const win2Width = Number(win2.native.contentView().frame().width);
+check("content that frames its own centre sits beside the inspector", Math.abs(besideWidth - (win2Width - 300)) < 2, { besideWidth, win2Width });
+check("and the side panes keep to their safe area", Number(beside.inspectorHost!.native.safeAreaInsets().top) >= 0);
+win2.close();
+
+console.log("scroll documents");
+const scroller = new ScrollView({ height: 100 }, new VStack({}, [new Label({ text: "top" })]));
+check("a scroll view's document is flipped, so its top is zero", Boolean(scroller.native.documentView().isFlipped()));
+check("and it does not inset itself for a toolbar", !scroller.native.automaticallyAdjustsContentInsets());
 
 console.log("glass and buttons");
 const glassButton = new Button({ title: "Load", glass: true, prominence: "primary", tint: "blue", shape: "capsule" });

@@ -4,7 +4,7 @@
 // misery, so it is the primitive here. Raw anchors remain reachable through
 // View.constrain() and .native for the other 20%.
 
-import { objc } from "../objc.ts";
+import { createDelegate, objc } from "../objc.ts";
 import { View, type ViewOptions } from "./view.ts";
 import {
   BorderType,
@@ -227,6 +227,14 @@ export interface ScrollOptions extends ViewOptions {
   fitWidth?: boolean;
 }
 
+/** A plain view that says it is flipped — the document of a {@link ScrollView}. */
+function flippedDocument(): any {
+  return createDelegate(
+    { isFlipped: () => true },
+    { superclass: "NSView", name: "FlippedDocument", types: { isFlipped: "B@:" } },
+  );
+}
+
 /** A scrolling container around a single content view. */
 export class ScrollView extends View {
   #content: View | null = null;
@@ -238,6 +246,10 @@ export class ScrollView extends View {
     sv.setAutohidesScrollers_(true);
     sv.setBorderType_(options.border ? BorderType.Bezel : BorderType.None);
     sv.setDrawsBackground_(false);
+    // Insets come from the layout, never from AppKit guessing: in a full-size-content window
+    // a scroll view otherwise insets itself by the toolbar's height, on top of a pane that
+    // already keeps to its safe area, and its first rows start scrolled out of sight.
+    sv.setAutomaticallyAdjustsContentInsets_(false);
     if (options.horizontal !== true) sv.setHorizontalScrollElasticity_(ScrollElasticity.None);
     super(sv, options);
     // An NSScrollView has no intrinsic height, so give it a floor rather than
@@ -258,15 +270,28 @@ export class ScrollView extends View {
       this.native.setDocumentView_(null);
       return;
     }
-    this.native.setDocumentView_(v.native);
+    // The content sits in a **flipped** document, so the top of it is y = 0 and it grows
+    // downwards. AppKit's default document is not flipped: its origin is the bottom-left, a
+    // document that grows after it is shown grows *upwards* out of view, and a page whose
+    // tables fill in a frame later opens scrolled part-way down its own contents.
+    const doc = flippedDocument();
+    doc.setTranslatesAutoresizingMaskIntoConstraints_(false);
+    doc.addSubview_(v.native);
+    const pin = (item: any, attr: number, to: any) => {
+      const c = objc.NSLayoutConstraint.constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant_(
+        item, attr, LayoutRelation.Equal, to, attr, 1.0, 0,
+      );
+      c.setActive_(true);
+      this.retainJS(c);
+    };
+    for (const attr of [LayoutAttribute.Top, LayoutAttribute.Leading, LayoutAttribute.Trailing, LayoutAttribute.Bottom]) {
+      pin(v.native, attr, doc);
+    }
+    this.native.setDocumentView_(doc);
+    this.retainJS(doc);
     // A document view sized by constraints still needs its width pinned to the
     // clip view, otherwise it collapses to its intrinsic width.
-    const clip = this.native.contentView();
-    const c = objc.NSLayoutConstraint.constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant_(
-      v.native, LayoutAttribute.Width, LayoutRelation.Equal, clip, LayoutAttribute.Width, 1.0, 0,
-    );
-    c.setActive_(true);
-    this.retainJS(c);
+    pin(doc, LayoutAttribute.Width, this.native.contentView());
   }
 
   scrollToTop(): void {

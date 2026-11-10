@@ -482,6 +482,13 @@ export interface SplitLayoutOptions {
   inspector?: { view: View } & PaneWidth;
   /** A strip pinned to the top of the content pane, under the toolbar. */
   contentAccessory?: View;
+  /**
+   * Whether the content runs under the sidebar and the inspector as well as the toolbar.
+   * Default `true` — right for a picture or a map, whose middle can be anywhere. A view that
+   * frames something in its own centre (a 3D camera) wants `false`: it then sits beside the
+   * panes, and only the toolbar's glass is over it.
+   */
+  contentUnderPanes?: boolean;
 }
 
 /**
@@ -508,29 +515,29 @@ export class SplitLayout {
 
   constructor(options: SplitLayoutOptions) {
     this.controller = objc.NSSplitViewController.alloc().init();
-    const pane = (view: View): { host: Container; vc: any } => {
+    const pane = (view: View, safe: boolean): { host: Container; vc: any } => {
       const host = new Container();
-      host.fill(view);
+      place(host, view, safe);
       const vc = objc.NSViewController.alloc().init();
       vc.setView_(host.native);
       this.#keep.push(vc, host);
       return { host, vc };
     };
     if (options.sidebar) {
-      const { host, vc } = pane(options.sidebar.view);
+      const { host, vc } = pane(options.sidebar.view, true);
       this.sidebarHost = host;
       this.sidebarItem = objc.NSSplitViewItem.sidebarWithViewController_(vc);
       applyWidth(this.sidebarItem, options.sidebar);
       this.controller.addSplitViewItem_(this.sidebarItem);
     }
-    const content = pane(options.content);
+    const content = pane(options.content, false);
     this.contentHost = content.host;
     this.#content = options.content;
     this.contentItem = objc.NSSplitViewItem.splitViewItemWithViewController_(content.vc);
-    this.contentItem.setAutomaticallyAdjustsSafeAreaInsets_(true);
+    this.contentItem.setAutomaticallyAdjustsSafeAreaInsets_(options.contentUnderPanes ?? true);
     this.controller.addSplitViewItem_(this.contentItem);
     if (options.inspector) {
-      const { host, vc } = pane(options.inspector.view);
+      const { host, vc } = pane(options.inspector.view, true);
       this.inspectorHost = host;
       this.inspectorItem = objc.NSSplitViewItem.inspectorWithViewController_(vc);
       applyWidth(this.inspectorItem, options.inspector);
@@ -548,7 +555,7 @@ export class SplitLayout {
   setContent(view: View): void {
     if (view === this.#content) return;
     this.#content.removeFromParent();
-    this.contentHost.fill(view);
+    place(this.contentHost, view, false);
     this.#content = view;
   }
 
@@ -607,6 +614,30 @@ export class SplitLayout {
     const frame = native.frame();
     native.setContentViewController_(this.controller);
     native.setFrame_display_(frame, true);
+  }
+}
+
+/**
+ * Put a pane's view in its host. The side panes keep to the safe area, so their first row
+ * starts under the toolbar rather than behind it; the content fills its host edge to edge
+ * and runs under the toolbar, as macOS 26 means content to.
+ */
+function place(host: Container, view: View, safe: boolean): void {
+  if (!safe) {
+    host.fill(view);
+    return;
+  }
+  host.add(view);
+  const guide = host.native.safeAreaLayoutGuide();
+  for (const [a, b] of [
+    ["topAnchor", "topAnchor"],
+    ["bottomAnchor", "bottomAnchor"],
+    ["leadingAnchor", "leadingAnchor"],
+    ["trailingAnchor", "trailingAnchor"],
+  ] as const) {
+    const c = view.native[a]().constraintEqualToAnchor_(guide[b]());
+    c.setActive_(true);
+    host.retainJS(c);
   }
 }
 
