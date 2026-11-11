@@ -133,6 +133,7 @@ export class Menu {
 }
 
 export interface StandardMenuOptions {
+  /** The name in About, Hide and Quit. Default: the bundle's display name ({@link bundledAppName}), else the process's. */
   appName?: string;
   about?: boolean | (() => void);
   preferences?: () => void;
@@ -152,9 +153,28 @@ export interface StandardMenuOptions {
  * Quit routes through the runtime's quit() rather than -[NSApp terminate:], so
  * JS gets to unwind instead of being exit()'d out from under.
  */
+/**
+ * The app's name as people see it, when it is running from a bundled `.app`: the bundle's
+ * `CFBundleDisplayName`, else its `CFBundleName`. `undefined` from source (`bun run`), where the
+ * process is Bun and its name is not the app's.
+ */
+export function bundledAppName(): string | undefined {
+  const bundle = objc.NSBundle.mainBundle();
+  if (!bundle || bundle.ptr === 0n) return undefined;
+  if (!str(bundle.bundlePath()).endsWith(".app")) return undefined;
+  for (const key of ["CFBundleDisplayName", "CFBundleName"]) {
+    const value = bundle.objectForInfoDictionaryKey_(key);
+    if (value && value.ptr !== 0n) {
+      const name = str(value);
+      if (name.length > 0) return name;
+    }
+  }
+  return undefined;
+}
+
 export function standardMenu(options: StandardMenuOptions = {}): Menu {
   const app = objc.NSApplication.sharedApplication();
-  const name = options.appName ?? str(objc.NSProcessInfo.processInfo().processName());
+  const name = options.appName ?? bundledAppName() ?? str(objc.NSProcessInfo.processInfo().processName());
   const bar = new Menu("MainMenu");
 
   // --- application menu ----------------------------------------------------

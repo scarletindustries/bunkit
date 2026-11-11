@@ -46,8 +46,18 @@ export interface BundleOptions {
    * that way fails to load in the app and works from source, which is the worst way round.
    */
   workers?: string[];
-  /** App name: the .app directory, CFBundleName and the executable. */
+  /** App name: the .app directory and the executable — and what people see, unless {@link displayName} says otherwise. */
   name?: string;
+  /**
+   * What people see the app called — Finder, the Dock, Launchpad, Spotlight, Get Info and the
+   * menu bar — when that is not the file's name: `name: "hiettlight2"` (`hiettlight2.app`) shown
+   * as **HiettLight 2**. Sets `CFBundleName` (the menu bar's) to it, and writes it as both
+   * names to `Resources/en.lproj/InfoPlist.strings` with `LSHasLocalizedDisplayName`. The
+   * `Info.plist`'s own `CFBundleDisplayName` stays the file's name: Finder shows the localized
+   * name only when the unlocalized one matches the file, which is also how a renamed copy shows
+   * its new name. Defaults to `name`.
+   */
+  displayName?: string;
   /** CFBundleIdentifier, e.g. "com.example.myapp". */
   identifier?: string;
   /** CFBundleShortVersionString — the human version, e.g. "1.2.0". */
@@ -130,6 +140,15 @@ function titleCase(s: string): string {
     .filter(Boolean)
     .map((w) => (/^[A-Z]/.test(w) ? w : w[0]!.toUpperCase() + w.slice(1)))
     .join("");
+}
+
+/**
+ * `InfoPlist.strings` naming a bundle `displayName`: `CFBundleName` and `CFBundleDisplayName`,
+ * quoted as a strings file wants (backslashes and quotes escaped). Pure.
+ */
+export function infoPlistStrings(displayName: string): string {
+  const quoted = `"${displayName.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  return `CFBundleName = ${quoted};\nCFBundleDisplayName = ${quoted};\n`;
 }
 
 /** Bundle identifiers may only contain alphanumerics, hyphen and dot. */
@@ -384,6 +403,7 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
   if (!existsSync(entry)) throw new Error(`entry point not found: ${entry}`);
 
   const name = options.name ?? titleCase(basename(entry, extname(entry)));
+  const displayName = options.displayName ?? name;
   const identifier = options.identifier ?? `com.example.${idSafe(name)}`;
   const version = options.version ?? "1.0.0";
   const buildVersion = options.build ?? version;
@@ -499,11 +519,13 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
   // --- Info.plist ----------------------------------------------------------
   const info: Record<string, PlistValue> = {
     CFBundleDevelopmentRegion: "en",
+    // The file's name here and the shown name in `en.lproj` below: Finder takes the localized
+    // name only when the unlocalized one matches the file it is reading (`hiettlight2.app`).
     CFBundleDisplayName: name,
     CFBundleExecutable: name,
     CFBundleIdentifier: identifier,
     CFBundleInfoDictionaryVersion: "6.0",
-    CFBundleName: name,
+    CFBundleName: displayName,
     CFBundlePackageType: "APPL",
     CFBundleShortVersionString: version,
     CFBundleSignature: "????",
@@ -516,6 +538,14 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
   };
   if (iconFile) info.CFBundleIconFile = "AppIcon";
   if (iconAsset) info.CFBundleIconName = "AppIcon";
+  if (displayName !== name) {
+    // Finder shows a bundle's *file* name unless it is told the bundle has a localized one.
+    info.LSHasLocalizedDisplayName = true;
+    const lproj = join(resourcesDir, "en.lproj");
+    mkdirSync(lproj, { recursive: true });
+    writeFileSync(join(lproj, "InfoPlist.strings"), infoPlistStrings(displayName));
+    log(verbose, `  name      ${name}.app, shown as "${displayName}"`);
+  }
   if (options.category) info.LSApplicationCategoryType = options.category;
   if (options.copyright) info.NSHumanReadableCopyright = options.copyright;
   if (options.agent) info.LSUIElement = true;

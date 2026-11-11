@@ -5,7 +5,7 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { compileIcon } from "../tools/bundle.ts";
+import { compileIcon, infoPlistStrings } from "../tools/bundle.ts";
 
 let failures = 0;
 function check(name: string, cond: unknown, extra?: unknown) {
@@ -15,6 +15,13 @@ function check(name: string, cond: unknown, extra?: unknown) {
     console.log(`  FAIL ${name}`, extra ?? "");
   }
 }
+
+// A display name apart from the file's: the strings file Finder reads it from, quoted safely.
+check(
+  "a display name is written as CFBundleName and CFBundleDisplayName",
+  infoPlistStrings("HiettLight 2") === 'CFBundleName = "HiettLight 2";\nCFBundleDisplayName = "HiettLight 2";\n',
+);
+check("quotes and backslashes in it are escaped", infoPlistStrings('A "B" \\ C').includes('"A \\"B\\" \\\\ C"'));
 
 const actool = Bun.spawnSync(["xcrun", "--find", "actool"], { stdout: "pipe", stderr: "pipe" });
 if (actool.exitCode !== 0) {
