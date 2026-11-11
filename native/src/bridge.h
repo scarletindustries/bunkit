@@ -193,6 +193,15 @@ void*       br_compile_take_reflection(void* job);
 const char* br_compile_error(void* job);
 void        br_compile_free(void* job);
 
+// --- MetalFX effects, built on a background queue (metalfx.m) -------------
+// kind: 0 a temporal scaler, 1 a frame interpolator, 2 a spatial scaler. The
+// descriptor is copied. Poll (0 building, 1 built, -1 failed), take the effect
+// (+1), and free the job exactly once.
+void* br_fx_create(void* device, void* descriptor, int kind);
+int   br_fx_poll(void* job);
+void* br_fx_take(void* job);
+void  br_fx_free(void* job);
+
 #ifdef __cplusplus
 }
 #endif

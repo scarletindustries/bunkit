@@ -150,6 +150,10 @@ export const lib = dlopen(LIB_PATH, {
   br_compile_take_reflection: { args: [OBJ], returns: OBJ },
   br_compile_error: { args: [OBJ], returns: OBJ },
   br_compile_free: { args: [OBJ], returns: V },
+  br_fx_create: { args: [OBJ, OBJ, I32], returns: OBJ },
+  br_fx_poll: { args: [OBJ], returns: I32 },
+  br_fx_take: { args: [OBJ], returns: OBJ },
+  br_fx_free: { args: [OBJ], returns: V },
   br_bundle_path: { args: [], returns: CSTR },
 }).symbols;
 
