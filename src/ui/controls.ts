@@ -11,6 +11,7 @@ import {
   BezelStyle,
   BorderType,
   ButtonType,
+  ControlBorderShape,
   ControlSize,
   ControlState,
   FontWeight,
@@ -757,6 +758,12 @@ export interface SegmentedOptions extends ViewOptions {
   items: string[];
   selected?: number;
   onChange?: (index: number, s: Segmented) => void;
+  /**
+   * The control's outline on macOS 26 (`borderShape`): `"capsule"` for one that sits in a
+   * Liquid Glass capsule — a floating strip, a toolbar group — where the default's rounded
+   * rectangle reads as a different shape from the glass around it. Ignored before macOS 26.
+   */
+  shape?: "automatic" | "capsule" | "roundedRectangle" | "circle";
 }
 
 export class Segmented extends View {
@@ -771,6 +778,10 @@ export class Segmented extends View {
     });
     sc.setSegmentStyle_(SegmentStyle.Rounded);
     sc.setSelectedSegment_(options.selected ?? 0);
+    if (options.shape && sc.respondsTo("setBorderShape:")) {
+      const key = (options.shape[0]!.toUpperCase() + options.shape.slice(1)) as keyof typeof ControlBorderShape;
+      sc.setBorderShape_(ControlBorderShape[key]);
+    }
     super(sc, options);
     if (options.onChange) this.onChange(options.onChange);
   }

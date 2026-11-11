@@ -4,6 +4,8 @@
 
 import {
   Button,
+  ControlBorderShape,
+  Segmented,
   Container,
   GlassView,
   Label,
@@ -339,6 +341,16 @@ check("a leading view takes the label's place", secondRow.children[0] === leadin
 const leadingColumns = formSection({ rows: [{ leading: leadingView, controls: [] }] });
 check("in a column layout too", ((leadingColumns.children[0] as VStack).children[0] as VStack).children[0] === leadingView);
 check("fixed-width digits are a font", makeFont({ size: 11, digits: true }) !== null);
+
+// A segmented control's outline: a capsule, to sit inside a glass capsule (macOS 26).
+const capsule = new Segmented({ items: ["Fast", "Fancy"], shape: "capsule" });
+const plain = new Segmented({ items: ["Fast", "Fancy"] });
+if (capsule.native.respondsTo("borderShape")) {
+  check("shape: capsule draws a capsule", Number(capsule.native.borderShape()) === ControlBorderShape.Capsule);
+  check("and without it the control keeps AppKit's automatic shape", Number(plain.native.borderShape()) === ControlBorderShape.Automatic);
+} else {
+  check("before macOS 26 the shape is ignored, not a throw", capsule.selectedIndex === 0);
+}
 
 if (failures > 0) {
   console.log(`${failures} failure(s)`);

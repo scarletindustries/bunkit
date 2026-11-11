@@ -345,6 +345,17 @@ export const ScrollElasticity = pick({
   Allowed: "NSScrollElasticityAllowed",
 });
 
+/**
+ * The outline a control draws, macOS 26 (`NSControlBorderShape`). Capsule is what sits right
+ * inside a Liquid Glass capsule — a toolbar group, a floating strip.
+ */
+export const ControlBorderShape = pick({
+  Automatic: "NSControlBorderShapeAutomatic",
+  Capsule: "NSControlBorderShapeCapsule",
+  RoundedRectangle: "NSControlBorderShapeRoundedRectangle",
+  Circle: "NSControlBorderShapeCircle",
+});
+
 export const SegmentStyle = pick({
   Automatic: "NSSegmentStyleAutomatic",
   Rounded: "NSSegmentStyleRounded",
