@@ -47,6 +47,14 @@ check("one that does not is null, not a throw", symbol("no.such.symbol.anywhere"
 check("a sized symbol is an image", symbol("play.fill", { size: 20, weight: "bold" }) !== null);
 const sv = new SymbolView("checkmark.circle.fill", { color: "green" });
 check("a symbol view holds its image", sv.native.image() !== null);
+// A changed symbol keeps the size it was made with: it came back at the default, so a column of
+// icons changed at runtime came out in two sizes.
+const sized = new SymbolView("info.circle", { size: 14, weight: "semibold" });
+const madeAt = sized.native.image().size();
+sized.name = "exclamationmark.triangle.fill";
+sized.name = "info.circle";
+const after = sized.native.image().size();
+check("a changed symbol keeps its size and weight", Number(after.width) === Number(madeAt.width) && Number(after.height) === Number(madeAt.height), { madeAt, after });
 
 console.log("symbol tiles");
 const tile = new SymbolTile("gearshape.fill", { color: "gray" });

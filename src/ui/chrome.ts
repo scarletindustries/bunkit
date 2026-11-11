@@ -59,17 +59,26 @@ export function symbol(name: string, options: SymbolOptions = {}): any {
 
 /** An image view showing an SF Symbol, optionally tinted. */
 export class SymbolView extends View {
+  /** The size and weight it was made with, which every later symbol keeps. */
+  readonly #symbolOptions: SymbolOptions;
+
   constructor(name: string, options: SymbolOptions & ViewOptions & { color?: any } = {}) {
     const view = objc.NSImageView.imageViewWithImage_(symbol(name, options) ?? objc.NSImage.alloc().init());
     super(view, options);
+    this.#symbolOptions = { size: options.size, weight: options.weight };
     if (options.color !== undefined) this.color = options.color;
     this.native.setContentHuggingPriority_forOrientation_(750, 0);
     this.native.setContentHuggingPriority_forOrientation_(750, 1);
   }
 
-  /** Show a different symbol. */
+  /**
+   * Show a different symbol, at the size and weight the view was made with. It used to drop
+   * them: a 14-point semibold symbol changed to another came back at the default size, so a
+   * column of icons changed at runtime came out in two sizes and pushed their text about.
+   * Side effect: sets the image view's image.
+   */
   set name(name: string) {
-    this.native.setImage_(symbol(name));
+    this.native.setImage_(symbol(name, this.#symbolOptions) ?? objc.NSImage.alloc().init());
   }
 
   /** Tint it — a colour name, hex, or `NSColor`; `null` for the default. */
