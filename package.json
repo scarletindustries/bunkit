@@ -42,7 +42,8 @@
     "./runtime": "./src/runtime.ts",
     "./structs": "./src/structs.ts",
     "./types": "./src/generated/appkit.d.ts",
-    "./metal": "./src/metal/index.ts"
+    "./metal": "./src/metal/index.ts",
+    "./net": "./src/net/index.ts"
   },
   "scripts": {
     "build": "./native/build.sh",

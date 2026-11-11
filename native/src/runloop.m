@@ -6,6 +6,7 @@
 
 #import <Cocoa/Cocoa.h>
 #include <mach/mach_time.h>
+#include <stdatomic.h>
 #include "bridge.h"
 
 typedef void (*br_void_fn)(uint32_t, uint32_t, void*, void*);
@@ -76,6 +77,11 @@ int  br_should_stop(void) { return g_stop; }
 // The pump
 // ---------------------------------------------------------------------------
 
+// A wake-up event posted by br_wake_pump and not yet taken off AppKit's queue,
+// and the data1 that marks one.
+static atomic_int g_wake_pending;
+#define BR_WAKE_MARK 0x77616b65 /* 'wake' */
+
 int br_pump(double seconds) {
   if (!NSApp) return 0;
   static int idleTicks = 0;
@@ -88,6 +94,12 @@ int br_pump(double seconds) {
                                    untilDate:deadline
                                       inMode:NSDefaultRunLoopMode
                                      dequeue:YES])) {
+      // Taken: the next wake-up must post again. Cleared here, not when a pump
+      // starts — between two pumps is exactly when JavaScript sends something and
+      // the answer arrives, and a flag still set then would let the next pump sleep.
+      if ([e type] == NSEventTypeApplicationDefined && [e data1] == BR_WAKE_MARK) {
+        atomic_store(&g_wake_pending, 0);
+      }
       @try {
         [NSApp sendEvent:e];
       } @catch (NSException* ex) {
@@ -110,6 +122,10 @@ int br_pump(double seconds) {
       }
     }
   }
+  // And here: one of AppKit's own nested loops (menu tracking, a modal session)
+  // may have taken the event instead, and a flag left set would stop every wake-up
+  // after it. At worst a second event is posted while one is still queued.
+  atomic_store(&g_wake_pending, 0);
   return n;
 }
 
@@ -125,6 +141,27 @@ void br_post_empty_event(void) {
                                      context:nil
                                      subtype:0
                                        data1:0
+                                       data2:0];
+    [NSApp postEvent:e atStart:YES];
+  }
+}
+
+// Wake the pump from another thread: post one empty event unless one is already
+// waiting. A pump asleep in AppKit returns at once; a main thread between two
+// pumps finds it at the start of the next and does not sleep there. At most one
+// is outstanding per pump, so a process that stops pumping does not collect them.
+void br_wake_pump(void) {
+  if (!NSApp) return;
+  if (atomic_exchange(&g_wake_pending, 1)) return;
+  @autoreleasepool {
+    NSEvent* e = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                                    location:NSZeroPoint
+                               modifierFlags:0
+                                   timestamp:0
+                                windowNumber:0
+                                     context:nil
+                                     subtype:0
+                                       data1:BR_WAKE_MARK
                                        data2:0];
     [NSApp postEvent:e atStart:YES];
   }

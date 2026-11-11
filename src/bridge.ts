@@ -155,6 +155,20 @@ export const lib = dlopen(LIB_PATH, {
   br_fx_take: { args: [OBJ], returns: OBJ },
   br_fx_free: { args: [OBJ], returns: V },
   br_bundle_path: { args: [], returns: CSTR },
+
+  // net.m: peer-to-peer connections. Handles are native heap addresses (plain numbers).
+  br_net_init: { args: [BUF], returns: V },
+  br_net_shutdown: { args: [], returns: V },
+  br_net_poll: { args: [BUF, I32], returns: I32 },
+  br_net_id: { args: [BUF], returns: U32 },
+  br_net_live: { args: [], returns: I64 },
+  br_net_listen: { args: [BUF, BUF, BUF, I32, I32, BUF, I32, U32, I32], returns: BUF },
+  br_net_listener_set_txt: { args: [BUF, BUF, I32], returns: V },
+  br_net_browse: { args: [BUF, I32], returns: BUF },
+  br_net_connect: { args: [BUF, BUF, BUF, BUF, BUF, I32, I32, BUF, I32, U32], returns: BUF },
+  br_net_send: { args: [BUF, BUF, U32, FFIType.u64], returns: I32 },
+  br_net_close: { args: [BUF], returns: V },
+  br_net_free: { args: [BUF], returns: V },
 }).symbols;
 
 // ---------------------------------------------------------------------------

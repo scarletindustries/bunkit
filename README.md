@@ -242,6 +242,56 @@ content under a sidebar or a toolbar also wants its camera centred on what's vis
 
 it's a `CAMetalLayer` rather than an `MTKView`, so frames come from bunkit's run loop instead of a second one. `.native` is on every object if you want the raw obj-c, and `scene.capture()` / `scene.snapshot()` read the framebuffer back — which is how all of this is tested, since nobody is watching.
 
+### peer to peer
+
+`bunkit/net` finds other macs nearby and talks to them, on network.framework: over awdl (the link airdrop uses — wi-fi on, no network joined), over a shared wi-fi network, or over an ethernet cable, whichever works. a listener advertises itself with bonjour, a browser finds every listener of a type along with its txt record before connecting, and a connection carries whole messages, in order.
+
+```ts
+import { PeerListener, PeerBrowser } from "bunkit/net";
+
+const listener = new PeerListener({ type: "_myapp._tcp", name: "Stage Mac", txt: { v: "1" } });
+listener.onConnection((c) => c.onMessage((m) => c.send(m)));   // handed over once ready
+
+const browser = new PeerBrowser({ type: "_myapp._tcp" });
+browser.onChange(async (peers) => {
+  const c = browser.connect(peers[0]!);
+  c.onMessage((m) => console.log(m.byteLength));
+  await c.opened();
+  await c.send(new Uint8Array(1024));   // resolves when network.framework has taken it
+  console.log(c.path);                  // { interface: "awdl0", peerToPeer: true, wired: false, … }
+});
+```
+
+a message is a 4-byte big-endian length and the bytes, at most 16 MiB, checked by the sender before it sends and by the receiver before it reads. a longer one, a peer that closes halfway through one, or a peer speaking tls to an end that isn't fails the connection with a reason rather than anything worse. every object stays open until either end closes it, like a socket.
+
+`tls: { psk, identity }` on a listener, a browser or a connection turns on tls with a pre-shared key: tls 1.2 with `TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256` and nothing else, so the key authenticates both ends and each connection still gets its own ephemeral secret. a wrong key fails in milliseconds and never reaches `onConnection`; a listener can hold several keys (one per paired peer) and picks by identity. the identity goes over the wire in the clear, so make it opaque. it isn't tls 1.3 because that doesn't work from here: on macOS 26.6 every tls 1.3 configuration with `sec_protocol_options_add_pre_shared_key` fails its handshake (-9858) even with the right key, and offered both versions it settles on 1.2.
+
+none of it runs on the main thread except your handlers. network.framework gets a private serial queue (`native/src/net.m`), where the reading, the framing and the copy into each message all happen; javascript takes whole messages in batches, woken by a `threadsafe` bun:ffi callback and — inside the run loop — an empty event that ends the pump's wait. a received message isn't copied again: the buffer it was put together in becomes the `Uint8Array`'s memory, freed when that's collected. `send` copies the bytes and returns (0.2 ms for 1 MiB, ~1.5 ms for 16 MiB), and its promise is the backpressure. a receiver that falls behind stops reading at 64 MiB per connection, so tcp's window closes and the sender's sends stop completing, rather than memory growing.
+
+measured on an m2 pro over loopback:
+
+| | |
+| --- | --- |
+| 1 MiB messages | ~4,000 MiB/s; ~1,600 MiB/s with the main thread busy 8 ms in every 10 |
+| 16 MiB messages | ~4,400 MiB/s; ~3,400 MiB/s with the main thread that busy |
+| a 1 ms timer's worst gap meanwhile | 1.2–1.8 ms in plain bun; 3–4.6 ms inside the run loop, most of it the pump's own 4 ms wait |
+| a small message's round trip | 0.12 ms median, 0.15 ms inside the run loop |
+
+handing network.framework the main queue instead was measured too, and lost: in a process that doesn't pump nothing moves at all, and with the main thread busy 8 ms in 10 it did 957 MiB/s against 1,544, and 1,368 against 3,527 with 16 MiB messages.
+
+**local network privacy.** on macOS 15 and later, browsing or advertising with bonjour needs the local network permission, which macOS asks for once per app. it belongs to the *responsible* process: run from a terminal that's the terminal (or the ide), not bun, so a terminal that's already been allowed never asks again. a bundled app declares why it wants it and which types it uses, through the bundler's `plist`:
+
+```ts
+plist: {
+  NSLocalNetworkUsageDescription: "Finds the other Macs in your rig.",
+  NSBonjourServices: ["_myapp._tcp"],
+},
+```
+
+loopback never needs it. `advertise: false` makes a listener without bonjour, reached with `PeerConnection.connect({ host: "127.0.0.1", port })`: measured in a process responsible for itself with no permission, no prompt and nothing in the privacy log. a browser that's been refused reports `"waiting"` with the reason, so an app can say where to go to allow it.
+
+to try awdl between two macs, turn wi-fi on in both but join no network (or be somewhere no network is known), unplug ethernet, and run `bun run tools/peer-check.ts` on each. they find each other on `awdl0`, connect, and print the route, the round trip and the throughput. `--tls <word>` does the same over tls, `--no-p2p` leaves awdl out.
+
 ### the annoying parts
 
 appkit runs its own nested run loop for modal dialogs, menu tracking, live resize and drags, and js is frozen the whole time it's in there. dialogs were the worst of it, so layer 3 gives you sheets instead: `alert`, `confirm`, `prompt`, `openFile` and `saveFile` all hand you a promise and the pump keeps ticking underneath. `alert` and `prompt` fall back to a blocking modal when there's no window to hang a sheet on, which is the only place `runModal` gets reached. menu tracking and live resize you just live with. they're bounded by someone letting go of the mouse.

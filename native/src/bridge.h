@@ -171,6 +171,7 @@ void br_stop(void);
 int  br_should_stop(void);
 void br_set_stop_callback(void* js_callback);
 void br_post_empty_event(void);
+void br_wake_pump(void); // from any thread: one empty event, unless one is already waiting
 double br_now(void);
 
 // --- drawables, taken off the main thread (drawables.m) --------------------
@@ -201,6 +202,29 @@ void* br_fx_create(void* device, void* descriptor, int kind);
 int   br_fx_poll(void* job);
 void* br_fx_take(void* job);
 void  br_fx_free(void* job);
+
+// --- peer-to-peer connections on Network.framework (net.m) ----------------
+// Everything runs on one private serial queue; JavaScript takes what happened
+// with br_net_poll (40-byte records, see net.m) after `notify` — a threadsafe
+// callback — says there is something to take. Handles are reference counted:
+// br_net_free drops JavaScript's reference exactly once per handle.
+void     br_net_init(void* notify);
+void     br_net_shutdown(void);
+int32_t  br_net_poll(void* out, int32_t cap);
+void     br_net_release_bytes(void* bytes, void* context);
+uint32_t br_net_id(void* handle);
+long     br_net_live(void);
+void*    br_net_listen(const char* type, const char* name, const void* txt, int32_t txt_len,
+                       int32_t peer_to_peer, const void* keys, int32_t keys_len,
+                       uint32_t max_message, int32_t port);
+void     br_net_listener_set_txt(void* listener, const void* txt, int32_t txt_len);
+void*    br_net_browse(const char* type, int32_t peer_to_peer);
+void*    br_net_connect(void* browser, const char* name, const char* type, const char* domain,
+                        const char* host, int32_t port, int32_t peer_to_peer, const void* keys,
+                        int32_t keys_len, uint32_t max_message);
+int32_t  br_net_send(void* connection, const void* bytes, uint32_t length, uint64_t sequence);
+void     br_net_close(void* handle);
+void     br_net_free(void* handle);
 
 #ifdef __cplusplus
 }

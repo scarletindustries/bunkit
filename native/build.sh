@@ -33,6 +33,8 @@ clang -arch arm64 \
   -framework Cocoa \
   -framework CoreGraphics \
   -framework QuartzCore \
+  -framework Network `# net.m: listeners, browsers, connections` \
+  -framework Security `# net.m: TLS with pre-shared keys` \
   -lffi \
   -o "$OUT/libobjcbridge.dylib" \
   "$SRC"/*.m
