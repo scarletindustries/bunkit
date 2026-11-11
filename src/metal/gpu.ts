@@ -32,10 +32,22 @@ export const PixelFormat = {
   bgra8unorm: 80,
   bgra8unorm_srgb: 81,
   rgba8unorm: 70,
+  rgba8unorm_srgb: 71,
   rgba16float: 115,
+  rgba16unorm: 110,
   rgba32float: 125,
+  rgb10a2unorm: 90,
+  rg11b10float: 92,
+  rg8unorm: 30,
+  rg16float: 65,
+  rg32float: 105,
+  r8unorm: 10,
+  r16unorm: 20,
   r32float: 55,
   r16float: 25,
+  r32uint: 53,
+  rg32uint: 103,
+  rgba32uint: 123,
   depth32float: 252,
   depth16unorm: 250,
 } as const;
@@ -90,6 +102,10 @@ export const size3 = (w: number, h = 1, d = 1) =>
 
 export const region2d = (x: number, y: number, w: number, h: number) =>
   new BigUint64Array([BigInt(x), BigInt(y), 0n, BigInt(w), BigInt(h), 1n]);
+
+/** An MTLRegion with depth: origin (x, y, z) and size (w, h, d). For 3D textures. */
+export const region3d = (x: number, y: number, z: number, w: number, h: number, d: number) =>
+  new BigUint64Array([BigInt(x), BigInt(y), BigInt(z), BigInt(w), BigInt(h), BigInt(d)]);
 
 export const clearColor = (c: readonly number[]) =>
   new Float64Array([c[0] ?? 0, c[1] ?? 0, c[2] ?? 0, c[3] ?? 1]);
@@ -373,33 +389,80 @@ function formatShaderError(message: string, source: string, label: string): stri
 // Textures and samplers
 // ---------------------------------------------------------------------------
 
+/** MTLTextureType, for the shapes a texture can take. */
+const TextureType = { "1d": 0, "2d": 2, "2dArray": 3, "2dMultisample": 4, cube: 5, "3d": 7 } as const;
+export type TextureTypeName = Exclude<keyof typeof TextureType, "1d" | "2dMultisample">;
+
 export interface TextureOptions {
   width: number;
   height: number;
+  /**
+   * The texture's shape. Default `"2d"` (or a multisample 2D when `sampleCount > 1`).
+   *
+   * `"3d"` takes {@link depth} slices and is sampled as `texture3d<float>` — a volume, such as a
+   * fog density field. `"2dArray"` takes {@link arrayLength} layers and is sampled as
+   * `texture2d_array<float>` (or `depth2d_array<float>` for a depth format) — a stack of shadow
+   * maps, say. `"cube"` is six square faces.
+   */
+  type?: TextureTypeName;
+  /** Slices of a `"3d"` texture. Ignored otherwise. Default 1. */
+  depth?: number;
+  /** Layers of a `"2dArray"` texture. Ignored otherwise. Default 1. */
+  arrayLength?: number;
   format?: PixelFormatName;
   usage?: Array<keyof typeof TextureUsage>;
   storage?: keyof typeof StorageMode;
   sampleCount?: number;
+  /** A full mip chain, down to 1×1. Shorthand for `mipLevels` of every level. */
   mipmapped?: boolean;
+  /** How many mip levels, when not the full chain. Overrides `mipmapped`. */
+  mipLevels?: number;
   label?: string;
+}
+
+/** How many mip levels a full chain has for a texture of this size: down to 1×1. Pure. */
+export function fullMipCount(width: number, height: number, depth = 1): number {
+  return Math.floor(Math.log2(Math.max(1, width, height, depth))) + 1;
 }
 
 export class Texture {
   readonly native: MTLObject;
   readonly width: number;
   readonly height: number;
+  /** Slices of a 3D texture; 1 for anything else. */
+  readonly depth: number;
+  /** Layers of an array texture; 1 for anything else. */
+  readonly arrayLength: number;
   readonly format: number;
   readonly sampleCount: number;
+  readonly mipLevels: number;
+  readonly type: TextureTypeName;
 
-  constructor(device: MTLObject, o: TextureOptions) {
+  constructor(device: MTLObject, o: TextureOptions, native?: MTLObject) {
     this.width = Math.max(1, Math.round(o.width));
     this.height = Math.max(1, Math.round(o.height));
+    this.type = o.type ?? "2d";
+    this.depth = this.type === "3d" ? Math.max(1, Math.round(o.depth ?? 1)) : 1;
+    this.arrayLength = this.type === "2dArray" ? Math.max(1, Math.round(o.arrayLength ?? 1)) : 1;
     this.format = PixelFormat[o.format ?? "bgra8unorm"];
     this.sampleCount = o.sampleCount ?? 1;
+    const full = fullMipCount(this.width, this.height, this.depth);
+    this.mipLevels = Math.max(1, Math.min(full, o.mipLevels ?? (o.mipmapped ? full : 1)));
 
-    const d = objc.MTLTextureDescriptor.texture2DDescriptorWithPixelFormat_width_height_mipmapped_(
-      this.format, this.width, this.height, o.mipmapped ?? false,
-    );
+    // A view made by Texture.view() wraps a texture Metal already made.
+    if (native) {
+      this.native = native;
+      return;
+    }
+
+    const d = objc.MTLTextureDescriptor.alloc().init();
+    d.setPixelFormat_(this.format);
+    d.setWidth_(this.width);
+    d.setHeight_(this.height);
+    d.setDepth_(this.depth);
+    d.setArrayLength_(this.arrayLength);
+    d.setMipmapLevelCount_(this.mipLevels);
+    d.setTextureType_(this.sampleCount > 1 ? TextureType["2dMultisample"] : TextureType[this.type]);
     let usage = 0;
     for (const u of o.usage ?? ["shaderRead", "renderTarget"]) usage |= TextureUsage[u];
     d.setUsage_(usage);
@@ -408,33 +471,56 @@ export class Texture {
     const isDepth = this.format === PixelFormat.depth32float || this.format === PixelFormat.depth16unorm;
     const storage = o.storage ?? (isDepth || this.sampleCount > 1 ? "private" : "shared");
     d.setStorageMode_(StorageMode[storage]);
-    if (this.sampleCount > 1) {
-      d.setTextureType_(4); // type2DMultisample
-      d.setSampleCount_(this.sampleCount);
-    }
-    const native = device.newTextureWithDescriptor_(d);
-    if (!native || native.ptr === NIL) throw new Error(`could not create texture ${o.label ?? ""}`);
-    if (o.label) native.setLabel_(o.label);
-    this.native = native;
+    if (this.sampleCount > 1) d.setSampleCount_(this.sampleCount);
+    const made = device.newTextureWithDescriptor_(d);
+    if (!made || made.ptr === NIL) throw new Error(`could not create texture ${o.label ?? ""}`);
+    if (o.label) made.setLabel_(o.label);
+    this.native = made;
   }
 
   /** Bytes one pixel occupies in this format, for read() and write(). */
   get bytesPerPixel(): number {
     switch (this.format) {
-      case PixelFormat.rgba32float: return 16;
-      case PixelFormat.rgba16float: return 8;
-      case PixelFormat.r32float: return 4;
-      case PixelFormat.r16float: return 2;
+      case PixelFormat.rgba32float: case PixelFormat.rgba32uint: return 16;
+      case PixelFormat.rgba16float: case PixelFormat.rgba16unorm:
+      case PixelFormat.rg32float: case PixelFormat.rg32uint: return 8;
+      case PixelFormat.r32float: case PixelFormat.r32uint: case PixelFormat.rg16float: return 4;
+      case PixelFormat.r16float: case PixelFormat.r16unorm: case PixelFormat.rg8unorm: return 2;
+      case PixelFormat.r8unorm: return 1;
       default: return 4;
     }
   }
 
-  /** Upload pixels. RGBA8 unless the texture says otherwise. */
-  write(pixels: ArrayBufferView, bytesPerRow = this.width * this.bytesPerPixel): this {
+  /**
+   * Upload pixels, into mip level 0 (or `options.level`). RGBA8 unless the texture says
+   * otherwise.
+   *
+   * For a 3D texture `pixels` holds every slice, one after another, and for an array texture
+   * `options.slice` picks the layer. Side effect: replaces the texture's contents in that region;
+   * only valid for shared or managed storage.
+   */
+  write(
+    pixels: ArrayBufferView,
+    bytesPerRow?: number,
+    options: { level?: number; slice?: number } = {},
+  ): this {
+    const level = options.level ?? 0;
+    const w = Math.max(1, this.width >> level);
+    const h = Math.max(1, this.height >> level);
+    const row = bytesPerRow ?? w * this.bytesPerPixel;
     const bytes = new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength);
-    this.native.replaceRegion_mipmapLevel_withBytes_bytesPerRow_(
-      region2d(0, 0, this.width, this.height), 0, ptr(bytes), bytesPerRow,
-    );
+    if (this.type === "3d") {
+      const d = Math.max(1, this.depth >> level);
+      this.native.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage_(
+        region3d(0, 0, 0, w, h, d), level, 0, ptr(bytes), row, row * h,
+      );
+    } else if (options.slice !== undefined) {
+      this.native.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage_(
+        region2d(0, 0, w, h), level, options.slice, ptr(bytes), row, row * h,
+      );
+    } else {
+      this.native.replaceRegion_mipmapLevel_withBytes_bytesPerRow_(region2d(0, 0, w, h), level, ptr(bytes), row);
+    }
     return this;
   }
 
@@ -442,22 +528,86 @@ export class Texture {
    * Read the texture back. Only valid for shared storage.
    *
    * The bytes are in the texture's own format — a 16-bit float target comes
-   * back as half floats, not as something you can index as RGBA8.
+   * back as half floats, not as something you can index as RGBA8. A 3D texture comes back
+   * whole, slice after slice; an array texture gives `options.slice` (default 0).
    */
-  read(): Uint8Array {
-    const stride = this.width * this.bytesPerPixel;
-    const out = new Uint8Array(stride * this.height);
-    this.native.getBytes_bytesPerRow_fromRegion_mipmapLevel_(
-      ptr(out), stride, region2d(0, 0, this.width, this.height), 0,
-    );
+  read(options: { level?: number; slice?: number } = {}): Uint8Array {
+    const level = options.level ?? 0;
+    const w = Math.max(1, this.width >> level);
+    const h = Math.max(1, this.height >> level);
+    const stride = w * this.bytesPerPixel;
+    if (this.type === "3d") {
+      const d = Math.max(1, this.depth >> level);
+      const out = new Uint8Array(stride * h * d);
+      this.native.getBytes_bytesPerRow_bytesPerImage_fromRegion_mipmapLevel_slice_(
+        ptr(out), stride, stride * h, region3d(0, 0, 0, w, h, d), level, 0,
+      );
+      return out;
+    }
+    const out = new Uint8Array(stride * h);
+    if (options.slice !== undefined) {
+      this.native.getBytes_bytesPerRow_bytesPerImage_fromRegion_mipmapLevel_slice_(
+        ptr(out), stride, stride * h, region2d(0, 0, w, h), level, options.slice,
+      );
+    } else {
+      this.native.getBytes_bytesPerRow_fromRegion_mipmapLevel_(ptr(out), stride, region2d(0, 0, w, h), level);
+    }
     return out;
+  }
+
+  /**
+   * A view of part of this texture: one mip level (or a run of them), one layer of an array, or
+   * the same pixels under another format of the same size.
+   *
+   *   const half = bloomChain.view({ level: 1 });   // write mip 1 from a kernel
+   *   const layer = shadows.view({ slice: 3 });      // render into layer 3 of a 2D array
+   *
+   * The view shares the texture's memory — writing through it writes the texture. The texture
+   * must have been made with the usage the view is used for. A single `slice` of an array or
+   * cube comes back as a plain 2D texture, which is what a render pass attaches.
+   */
+  view(o: { level?: number; levels?: number; slice?: number; slices?: number; format?: PixelFormatName } = {}): Texture {
+    const level = o.level ?? 0;
+    const levels = o.levels ?? 1;
+    const single = o.slice !== undefined && (o.slices ?? 1) === 1;
+    const slice = o.slice ?? 0;
+    const slices = o.slices ?? (o.slice !== undefined ? 1 : this.arrayLength * (this.type === "cube" ? 6 : 1));
+    const type: TextureTypeName = single && (this.type === "2dArray" || this.type === "cube") ? "2d" : this.type;
+    const format = o.format ? PixelFormat[o.format] : this.format;
+    const native = this.native.newTextureViewWithPixelFormat_textureType_levels_slices_(
+      // NSRange is a struct the bridge knows by name, so it takes the object form.
+      format, TextureType[type],
+      { location: level, length: levels },
+      { location: slice, length: slices },
+    );
+    if (!native || native.ptr === NIL) throw new Error("could not make a texture view");
+    const name = (Object.keys(PixelFormat) as PixelFormatName[]).find((k) => PixelFormat[k] === format);
+    return new Texture(null, {
+      width: Math.max(1, this.width >> level),
+      height: Math.max(1, this.height >> level),
+      depth: Math.max(1, this.depth >> level),
+      arrayLength: type === "2dArray" ? slices : 1,
+      type, format: name, mipLevels: levels, sampleCount: this.sampleCount,
+    }, native);
   }
 }
 
 export interface SamplerOptions {
   filter?: "nearest" | "linear";
   mip?: "none" | "nearest" | "linear";
-  address?: "clamp" | "repeat" | "mirror";
+  /**
+   * What a coordinate outside 0–1 reads. `"zero"` reads transparent black — what a shadow or a
+   * projected pattern wants past its edge. Applies to every axis, including a 3D texture's `r`.
+   */
+  address?: "clamp" | "repeat" | "mirror" | "zero";
+  /**
+   * Make this a **comparison** sampler, for `depth2d::sample_compare`: each tap answers whether
+   * the reference passes `compare` against the stored depth, and linear filtering blends four of
+   * those answers — hardware PCF. Shadow maps want `"lessEqual"`.
+   */
+  compare?: CompareName;
+  /** Anisotropic filtering, 1–16. Default 1 (off). */
+  anisotropy?: number;
   label?: string;
 }
 
@@ -469,9 +619,13 @@ export class Sampler {
     d.setMinFilter_(filter);
     d.setMagFilter_(filter);
     d.setMipFilter_({ none: 0, nearest: 1, linear: 2 }[o.mip ?? "linear"]);
-    const address = { clamp: 0, repeat: 2, mirror: 3 }[o.address ?? "clamp"];
+    // MTLSamplerAddressMode: clampToEdge 0, repeat 2, mirrorRepeat 3, clampToZero 4.
+    const address = { clamp: 0, repeat: 2, mirror: 3, zero: 4 }[o.address ?? "clamp"];
     d.setSAddressMode_(address);
     d.setTAddressMode_(address);
+    d.setRAddressMode_(address);
+    if (o.compare) d.setCompareFunction_(CompareFunction[o.compare]);
+    if (o.anisotropy && o.anisotropy > 1) d.setMaxAnisotropy_(Math.min(16, Math.round(o.anisotropy)));
     if (o.label) d.setLabel_(o.label);
     this.native = device.newSamplerStateWithDescriptor_(d);
   }

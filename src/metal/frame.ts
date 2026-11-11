@@ -52,6 +52,12 @@ export interface ColorAttachment {
   /** Multisample resolve target. Set when the attachment is multisampled. */
   resolve?: TextureLike;
   store?: boolean;
+  /** Which mip level to render into. Default 0. */
+  level?: number;
+  /** Which layer of an array (or face of a cube) to render into. Default 0. */
+  slice?: number;
+  /** Which slice of a 3D texture to render into. Default 0. */
+  depthPlane?: number;
 }
 
 export interface RenderPassOptions {
@@ -67,6 +73,13 @@ export interface RenderPassOptions {
    * discarding it saves writing it back to memory.
    */
   storeDepth?: boolean;
+  /**
+   * Keep what the depth attachment already holds instead of clearing it — for a pass that draws
+   * over an earlier one's depth (lighting volumes, transparent surfaces after an opaque pass).
+   */
+  loadDepth?: boolean;
+  /** Which layer of an array depth texture to render into. Default 0. */
+  depthSlice?: number;
   /** Clear colour, when `target` is used instead of an explicit attachment. */
   clear?: readonly number[] | false;
   label?: string;
@@ -92,6 +105,9 @@ export class RenderPass {
     colors.forEach((c, i) => {
       const a = descriptor.colorAttachments().objectAtIndexedSubscript_(i);
       a.setTexture_(attachment(c.texture));
+      if (c.level) a.setLevel_(c.level);
+      if (c.slice) a.setSlice_(c.slice);
+      if (c.depthPlane) a.setDepthPlane_(c.depthPlane);
       if (c.clear === false) {
         a.setLoadAction_(MTL.LoadAction.load);
       } else {
@@ -109,7 +125,8 @@ export class RenderPass {
     if (depth) {
       const d = descriptor.depthAttachment();
       d.setTexture_(attachment(depth));
-      d.setLoadAction_(MTL.LoadAction.clear);
+      if (o.depthSlice) d.setSlice_(o.depthSlice);
+      d.setLoadAction_(o.loadDepth ? MTL.LoadAction.load : MTL.LoadAction.clear);
       d.setStoreAction_(o.storeDepth ? MTL.StoreAction.store : MTL.StoreAction.dontCare);
       d.setClearDepth_(o.clearDepth ?? 1);
     }
@@ -341,6 +358,24 @@ export class ComputePass {
     return this;
   }
 
+  /**
+   * Dispatch exactly `width × height × depth` threads — one per pixel of an image, or per cell
+   * of a volume — in threadgroups of `threadgroup` (default 8×8×1, or 4×4×4 for a 3D grid).
+   *
+   * Uses Metal's non-uniform dispatch, so the edge groups are trimmed rather than run past the
+   * edge: a kernel needs no bounds check on its `thread_position_in_grid`. Every Apple-silicon
+   * GPU supports it.
+   */
+  dispatchThreads(
+    width: number, height = 1, depth = 1,
+    threadgroup: [number, number, number] = depth > 1 ? [4, 4, 4] : height > 1 ? [8, 8, 1] : [64, 1, 1],
+  ): this {
+    this.native.dispatchThreads_threadsPerThreadgroup_(
+      size3(width, height, depth), size3(threadgroup[0], threadgroup[1], threadgroup[2]),
+    );
+    return this;
+  }
+
   /** Dispatch an explicit 3D grid of threadgroups. */
   dispatchGroups(x: number, y = 1, z = 1, threadgroup: [number, number, number] = [8, 8, 1]): this {
     this.native.dispatchThreadgroups_threadsPerThreadgroup_(
@@ -486,6 +521,14 @@ export class Frame {
     } finally {
       encoder.endEncoding();
     }
+  }
+
+  /**
+   * Fill every mip level of `texture` below the first from the one above it, on the GPU — a
+   * bloom or exposure chain's levels, or a volume's. The texture needs more than one level.
+   */
+  mipmaps(texture: Texture | MTLObject): void {
+    this.blit((encoder) => encoder.generateMipmapsForTexture_(nativeOf(texture)));
   }
 
   get passCount(): number {

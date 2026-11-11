@@ -469,6 +469,21 @@ export interface Scene3DOptions extends Omit<GPUViewOptions, "onFrame"> {
   onFrame?: SceneHandler;
 }
 
+/**
+ * What a scene's {@link Scene3D.renderer} is handed: the camera's matrices for this frame, worked
+ * out exactly as the built-in pass would have used them (insets and all).
+ *
+ * The arrays are the scene's own and are rewritten every frame — valid during the call only.
+ */
+export interface SceneRenderInfo {
+  view: Mat4;
+  projection: Mat4;
+  viewProjection: Mat4;
+}
+
+/** A frame drawn some other way than the built-in pass. See {@link Scene3D.renderer}. */
+export type SceneRenderer = (frame: SceneFrame, info: SceneRenderInfo) => void;
+
 /** The frame a scene handler sees: an ordinary Frame, plus its scene. */
 export interface SceneFrame extends Frame {
   readonly scene: Scene3D;
@@ -513,6 +528,19 @@ export class Scene3D extends GPUView {
   background: [number, number, number, number];
   /** The post chain, when `bloom` was asked for. Tune it live. */
   readonly post: Bloom | null;
+  /**
+   * Draw the frame yourself, with this scene's camera, frame loop and handlers.
+   *
+   * When set, every frame still runs the handlers and works out the camera's matrices, then
+   * hands them to this function **instead of** encoding the built-in pass: the nodes are not
+   * drawn (nor their instance buffers filled) and the bloom chain does not run. The renderer
+   * writes the finished picture to `frame.resolveTexture ?? frame.colorTexture` — single-sampled
+   * when the view resolves, multisampled otherwise. `null` (the default) draws the nodes.
+   *
+   * A host uses it for a second way of drawing the same world — a far heavier one, say — that
+   * it can switch to and from without rebuilding the view.
+   */
+  renderer: SceneRenderer | null = null;
 
   #uniforms: GPUBuffer<any>;
   #defaultMaterial = new Material({ label: "lit" });
@@ -689,6 +717,13 @@ export class Scene3D extends GPUView {
       );
     }
     multiply(this.#projection, this.#view, this.#viewProjection);
+
+    if (this.renderer) {
+      this.renderer(scene, {
+        view: this.#view, projection: this.#projection, viewProjection: this.#viewProjection,
+      });
+      return;
+    }
 
     this.#uniforms.write({
       viewProjection: this.#viewProjection,

@@ -188,6 +188,8 @@ compute is the same shape. `gpu().kernel(source)` finds the entry point, `kernel
 
 `bun run particles` is a quarter of a million of them, simulated in a kernel and drawn as point sprites. per frame javascript writes two uniform structs — 128 bytes — and issues a dispatch, a draw and the bloom chain: 0.5ms of js against 3.2ms of gpu at 2000×1384. the particle count doesn't appear in the frame callback at all, so a million costs the gpu and not the loop.
 
+textures come in the shapes a renderer reaches for: `type: "3d"` for a volume (a fog field, a lookup table), `"2dArray"` for a stack of shadow maps, mip chains filled on the gpu with `frame.mipmaps(texture)`, and `texture.view({ level, slice })` to write one level or render into one layer. a sampler takes `compare: "lessEqual"` for hardware pcf through `depth2d::sample_compare`, and `pass.dispatchThreads(w, h, d)` runs one thread per pixel or voxel with no bounds check in the kernel. `Scene3D.renderer` hands a frame's camera matrices to a function of your own instead of drawing the nodes, so one view can have two renderers and switch between them.
+
 `src/metal/shaders.ts` has the msl you'd otherwise retype: aces, colour temperature in kelvin, ordered dither, value noise and fbm, sdfs, cone falloff. they're snippets — interpolate one and its dependencies come with it, deduplicated.
 
 ### a rig

@@ -889,5 +889,93 @@ fragment float4 fs(V in [[stage_in]]) {
   scene.dispose();
 }
 
+// --- volumes, arrays, views, comparison samplers, and a scene drawn another way ---------
+{
+  // A 4×4×4 volume of r32float, each cell its own index: written whole, read back whole, and
+  // read by a kernel through a texture3d — the shape a fog field takes.
+  const volume = g.texture({ type: "3d", width: 4, height: 4, depth: 4, format: "r32float",
+    usage: ["shaderRead", "shaderWrite"], label: "volume" });
+  const cells = new Float32Array(64).map((_, i) => i);
+  volume.write(cells);
+  const back = new Float32Array(volume.read().buffer);
+  check("a 3D texture round-trips every slice", back.length === 64 && back[37] === 37, back[37]);
+
+  const out = g.texture({ width: 4, height: 4, format: "r32float", usage: ["shaderRead", "shaderWrite"] });
+  const slice = g.kernel(msl`
+#include <metal_stdlib>
+using namespace metal;
+kernel void slice(texture3d<float, access::read> volume [[texture(0)]],
+                  texture2d<float, access::write> out [[texture(1)]],
+                  uint2 id [[thread_position_in_grid]]) {
+  out.write(volume.read(uint3(id, 2)), id);
+}`);
+  g.submit((commands) => {
+    const frame = new Frame(commands, { time: 0, dt: 0, index: 0, width: 4, height: 4 });
+    frame.compute((pass) => pass.pipeline(slice).bind({ volume, out }).dispatchThreads(4, 4));
+  });
+  const plane = new Float32Array(out.read().buffer);
+  check("dispatchThreads covers a 2D grid exactly, and a kernel reads a 3D texture",
+    plane[0] === 32 && plane[15] === 47, [plane[0], plane[15]]);
+
+  // A mip chain, filled on the GPU, and a view of one of its levels.
+  const chain = g.texture({ width: 8, height: 8, format: "rgba8unorm", mipmapped: true,
+    usage: ["shaderRead", "renderTarget"], label: "chain" });
+  check("a full mip chain goes down to 1×1", chain.mipLevels === 4, chain.mipLevels);
+  chain.write(new Uint8Array(8 * 8 * 4).fill(200));
+  g.submit((commands) => new Frame(commands, { time: 0, dt: 0, index: 0, width: 8, height: 8 }).mipmaps(chain));
+  const level2 = chain.read({ level: 2 });
+  check("mipmaps() fills the lower levels", level2.length === 16 && level2[0] === 200, level2[0]);
+  const view = chain.view({ level: 1 });
+  check("a view of level 1 is half the size", view.width === 4 && view.height === 4 && view.mipLevels === 1);
+
+  // A 2D array of depth maps: render into one layer, compare against it.
+  const shadows = g.texture({ type: "2dArray", arrayLength: 3, width: 8, height: 8,
+    format: "depth32float", usage: ["shaderRead", "renderTarget"], label: "shadows" });
+  check("an array texture keeps its layer count", shadows.arrayLength === 3 && shadows.type === "2dArray");
+  const layer = shadows.view({ slice: 1 });
+  check("one layer of it is a plain 2D texture", layer.type === "2d" && layer.width === 8);
+  const compare = g.sampler({ compare: "lessEqual", filter: "linear", mip: "none", address: "zero" });
+  check("a comparison sampler is made", !!compare.native);
+  const probe = g.texture({ width: 1, height: 1, format: "r32float", usage: ["shaderRead", "shaderWrite"] });
+  const shade = g.kernel(msl`
+#include <metal_stdlib>
+using namespace metal;
+kernel void shade(depth2d_array<float> maps [[texture(0)]],
+                  texture2d<float, access::write> probe [[texture(1)]],
+                  sampler cmp [[sampler(0)]],
+                  uint2 id [[thread_position_in_grid]]) {
+  // Layer 1 was cleared to 0.25: a reference of 0.2 passes (lit), 0.3 fails (in shadow).
+  float lit = maps.sample_compare(cmp, float2(0.5), 1, 0.2);
+  float dark = maps.sample_compare(cmp, float2(0.5), 1, 0.3);
+  probe.write(float4(lit * 10.0 + dark), id);
+}`);
+  g.submit((commands) => {
+    const frame = new Frame(commands, { time: 0, dt: 0, index: 0, width: 8, height: 8 });
+    frame.render({ color: [], depth: shadows, depthSlice: 1, clearDepth: 0.25, storeDepth: true, label: "clear layer" }, () => {});
+    frame.compute((pass) => pass.pipeline(shade).bind({ maps: shadows, probe, cmp: compare }).dispatchThreads(1, 1));
+  });
+  const verdict = new Float32Array(probe.read().buffer)[0];
+  check("sample_compare passes the near reference and fails the far one, on the right layer",
+    verdict === 10, verdict);
+
+  // A scene with a renderer draws nothing of its own and hands over its camera.
+  const scene = new Scene3D({ animate: false, sampleCount: 1, background: "#000000" });
+  scene.add(box({ size: 1, color: "#ffffff" }));
+  let seen: Float32Array | undefined;
+  const flat = g.effect(`return float4(0.0, 1.0, 0.0, 1.0);`);
+  scene.renderer = (frame, info) => {
+    seen = info.viewProjection;
+    frame.effect(flat, { to: frame.resolveTexture ?? frame.colorTexture });
+  };
+  const shot = scene.capture(16, 16);
+  check("a renderer replaces the built-in pass", shot.pixels[(8 * 16 + 8) * 4 + 1] === 255 && shot.pixels[(8 * 16 + 8) * 4] === 0,
+    Array.from(shot.pixels.slice((8 * 16 + 8) * 4, (8 * 16 + 8) * 4 + 4)));
+  check("and is handed the camera's matrices", seen !== undefined && seen.length === 16);
+  scene.renderer = null;
+  const plain = scene.capture(16, 16);
+  check("clearing it draws the nodes again", plain.pixels[(8 * 16 + 8) * 4 + 1]! !== 255 || plain.pixels[(8 * 16 + 8) * 4]! > 0);
+  scene.dispose();
+}
+
 console.log(failures === 0 ? "\nALL GPU TESTS PASSED" : `\n${failures} GPU FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);
