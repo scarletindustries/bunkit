@@ -306,10 +306,19 @@ if (!gpuAvailable()) {
     check("the layer sized itself to the backing store", size.width >= s.frame.width, JSON.stringify(size));
 
     let frames = 0;
-    s.onFrame(() => frames++);
+    let first: any;
+    s.onFrame((frame) => {
+      frames++;
+      first ??= frame.commands;
+    });
     s.start();
     for (let i = 0; i < 40; i++) pumpOnce(0.006);
     check("the run loop drives frames", frames > 3, frames);
+    // A finished frame's command buffer is let go: the only hold left on it is this test's
+    // wrapper. The retain taken at commit used to be kept for good — a command buffer leaked
+    // every frame, 1.5 KB of driver memory each, for as long as the window drew.
+    check("a drawn frame's command buffer is released once the GPU is done with it",
+      first && Number(first.retainCount()) === 1, first && Number(first.retainCount()));
     // Let the display report in, then ask when the frames reached it.
     for (let i = 0; i < 40 && s.stats.present.samples === 0; i++) pumpOnce(0.006);
     const present = s.stats.present;
