@@ -192,6 +192,8 @@ compute is the same shape. `gpu().kernel(source)` finds the entry point, `kernel
 
 textures come in the shapes a renderer reaches for: `type: "3d"` for a volume (a fog field, a lookup table), `"2dArray"` for a stack of shadow maps, mip chains filled on the gpu with `frame.mipmaps(texture)`, and `texture.view({ level, slice })` to write one level or render into one layer. a sampler takes `compare: "lessEqual"` for hardware pcf through `depth2d::sample_compare`, and `pass.dispatchThreads(w, h, d)` runs one thread per pixel or voxel with no bounds check in the kernel. `Scene3D.renderer` hands a frame's camera matrices to a function of your own instead of drawing the nodes, so one view can have two renderers and switch between them.
 
+metalfx is there too, with a fallback built in: `TemporalScaler.create(gpu(), { input, output, ... })` and `SpatialScaler.create(...)` load the framework themselves and hand back `null` where it's missing or won't take the sizes, so you always have somewhere to fall back to. measured on an m2 pro the temporal scaler is 1.2ms from 960×540 to 1600×900 and 4.1ms from 1382×894 to 3456×2234, and building one takes 0.1–0.3s (2.4s the first time in a process) — rebuild it per resolution and you'll feel it.
+
 `src/metal/shaders.ts` has the msl you'd otherwise retype: aces, colour temperature in kelvin, ordered dither, value noise and fbm, sdfs, cone falloff. they're snippets — interpolate one and its dependencies come with it, deduplicated.
 
 ### a rig

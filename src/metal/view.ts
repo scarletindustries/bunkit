@@ -90,7 +90,14 @@ export interface GPUViewStats {
   cpuMs: number;
   /** Milliseconds blocked in nextDrawable, which is the display pacing you. */
   waitMs: number;
-  /** Milliseconds the GPU spent, from its own timestamps. */
+  /**
+   * Milliseconds the GPU spent on the last finished frame, from its own timestamps: from when
+   * it started on that frame, or finished the one before, whichever is later, to when it
+   * finished. With two frames in flight the GPU starts the next before the last is done and
+   * the two overlap, and the plain start-to-end span then counts the wait for the last as
+   * this frame's work: measured on an M2 Pro, a frame the GPU turned round in 14 ms (70 fps)
+   * read 16 ms.
+   */
   gpuMs: number;
   /** Ticks skipped because the GPU had not caught up. */
   skipped: number;
@@ -108,6 +115,17 @@ export interface GPUViewStats {
   present: PresentStats;
   frame: number;
   drawableSize: { width: number; height: number };
+}
+
+/**
+ * What one frame's command buffer cost the GPU, milliseconds, from its own `GPUStartTime` and
+ * `GPUEndTime` (seconds) and when the GPU finished the frame before it (`previousEnd`, seconds,
+ * 0 for none). Pure. The overlap with the frame before is that frame's: with frames in flight
+ * the GPU starts the next before the last is done, and the plain span counts the wait.
+ */
+export function gpuBusyMs(start: number, end: number, previousEnd: number): number {
+  if (!(end > start)) return 0;
+  return (end - Math.max(start, Math.min(previousEnd, end))) * 1000;
 }
 
 export class GPUView extends View {
@@ -134,6 +152,8 @@ export class GPUView extends View {
   #cpuMs = 0;
   #waitMs = 0;
   #gpuMs = 0;
+  /** When the GPU finished the last frame retired, seconds on its clock. */
+  #gpuEnd = 0;
   #fps = 0;
   #fpsFrames = 0;
   #fpsMark = 0;
@@ -293,7 +313,8 @@ export class GPUView extends View {
       if (Number(buffer.status()) >= CommandBufferStatus.completed) {
         const start = Number(buffer.GPUStartTime());
         const end = Number(buffer.GPUEndTime());
-        if (end > start) this.#gpuMs = (end - start) * 1000;
+        if (end > start) this.#gpuMs = gpuBusyMs(start, end, this.#gpuEnd);
+        if (end > this.#gpuEnd) this.#gpuEnd = end;
         this.#inFlight.splice(i, 1);
       } else {
         i++;

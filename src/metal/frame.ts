@@ -28,6 +28,23 @@ import { gpu } from "./gpu.ts";
 import { applyBindings, computeSetters, type BindingSetters, type BindValue } from "./reflect.ts";
 import type { Effect, EffectPassOptions, RenderTarget } from "./effects.ts";
 
+/**
+ * Where a pass records its GPU start and end times: two indices of a counter sample buffer.
+ * Handed out by a {@link PassTimer}; see `./timer.ts`.
+ */
+export interface PassSamples {
+  /** The `MTLCounterSampleBuffer`. */
+  buffer: MTLObject;
+  start: number;
+  end: number;
+}
+
+/** Something that hands each pass of a frame its timestamp slots. See `GPUTimer` in `./timer.ts`. */
+export interface PassTimer {
+  /** Slots for the next pass, called `label`, or `undefined` when there are none left. */
+  next(label?: string): PassSamples | undefined;
+}
+
 /** Anywhere a texture is wanted, a RenderTarget stands in for its colour. */
 type TextureLike = Texture | RenderTarget | MTLObject;
 
@@ -94,7 +111,11 @@ export class RenderPass {
   #pipeline: RenderPipeline | null = null;
   #draws = 0;
 
-  constructor(commands: MTLObject, o: RenderPassOptions) {
+  /**
+   * Open a render pass on `commands`. With `samples`, the GPU writes its timestamps at the
+   * start of the pass's vertex work and the end of its fragment work into that buffer.
+   */
+  constructor(commands: MTLObject, o: RenderPassOptions, samples?: PassSamples) {
     const descriptor = objc.MTLRenderPassDescriptor.renderPassDescriptor();
     const colors: ColorAttachment[] =
       o.color ? (Array.isArray(o.color) ? o.color : [o.color])
@@ -131,6 +152,12 @@ export class RenderPass {
       d.setClearDepth_(o.clearDepth ?? 1);
     }
 
+    if (samples) {
+      const a = descriptor.sampleBufferAttachments().objectAtIndexedSubscript_(0);
+      a.setSampleBuffer_(samples.buffer);
+      a.setStartOfVertexSampleIndex_(samples.start);
+      a.setEndOfFragmentSampleIndex_(samples.end);
+    }
     const encoder = commands.renderCommandEncoderWithDescriptor_(descriptor);
     if (!encoder || encoder.ptr === NIL) {
       throw new Error(
@@ -306,8 +333,21 @@ export class ComputePass {
   readonly native: MTLObject;
   #pipeline: ComputePipeline | null = null;
 
-  constructor(commands: MTLObject, label?: string) {
-    this.native = commands.computeCommandEncoder();
+  /**
+   * Open a compute pass on `commands`. With `samples`, the GPU writes its timestamps at the
+   * pass's start and end into that buffer.
+   */
+  constructor(commands: MTLObject, label?: string, samples?: PassSamples) {
+    if (samples) {
+      const d = objc.MTLComputePassDescriptor.computePassDescriptor();
+      const a = d.sampleBufferAttachments().objectAtIndexedSubscript_(0);
+      a.setSampleBuffer_(samples.buffer);
+      a.setStartOfEncoderSampleIndex_(samples.start);
+      a.setEndOfEncoderSampleIndex_(samples.end);
+      this.native = commands.computeCommandEncoderWithDescriptor_(d);
+    } else {
+      this.native = commands.computeCommandEncoder();
+    }
     if (label) this.native.setLabel_(label);
   }
 
@@ -424,6 +464,13 @@ export class Frame {
 
   #passes = 0;
 
+  /**
+   * Time this frame's passes on the GPU: while set, every render, compute and effect pass the
+   * frame opens takes its timestamp slots from it. See `GPUTimer` in `./timer.ts`. Unset (the
+   * default), passes are opened exactly as before.
+   */
+  timing: PassTimer | undefined;
+
   constructor(
     commands: MTLObject,
     info: { time: number; dt: number; index: number; width: number; height: number },
@@ -441,7 +488,7 @@ export class Frame {
   render(o: RenderPassOptions, body: (pass: RenderPass) => void): void;
   render(o: RenderPassOptions, body?: (pass: RenderPass) => void): RenderPass | void {
     this.#passes++;
-    const pass = new RenderPass(this.commands, o);
+    const pass = new RenderPass(this.commands, o, this.timing?.next(o.label));
     if (!body) return pass;
     try {
       body(pass);
@@ -475,7 +522,7 @@ export class Frame {
   compute(): ComputePass;
   compute(body?: (pass: ComputePass) => void, label?: string): ComputePass | void {
     this.#passes++;
-    const pass = new ComputePass(this.commands, label);
+    const pass = new ComputePass(this.commands, label, this.timing?.next(label));
     if (!body) return pass;
     try {
       body(pass);

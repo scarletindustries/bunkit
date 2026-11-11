@@ -403,5 +403,14 @@ if (!gpuAvailable()) {
   check("after, it is measured", screenLatencyMs({ samples: MIN_PRESENT_SAMPLES, latencyMs: 12 }) === 12);
 }
 
+{
+  // A frame's GPU time is its own work: the overlap with the frame before is not counted twice.
+  const { gpuBusyMs } = await import("../src/metal/view.ts");
+  check("a frame alone costs its span", Math.abs(gpuBusyMs(1.0, 1.010, 0.5) - 10) < 1e-9);
+  check("a frame that started before the last finished costs from that finish",
+    Math.abs(gpuBusyMs(1.0, 1.016, 1.002) - 14) < 1e-9, gpuBusyMs(1.0, 1.016, 1.002));
+  check("nothing measured costs nothing", gpuBusyMs(0, 0, 0) === 0 && gpuBusyMs(2, 1, 0) === 0);
+}
+
 console.log(failures === 0 ? "\nALL METAL TESTS PASSED" : `\n${failures} METAL FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);

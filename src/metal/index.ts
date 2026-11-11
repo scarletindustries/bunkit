@@ -19,3 +19,5 @@ export * from "./present.ts";
 export * from "./math.ts";
 export * from "./geometry.ts";
 export * from "./scene.ts";
+export * from "./metalfx.ts";
+export * from "./timer.ts";
