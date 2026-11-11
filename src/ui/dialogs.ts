@@ -14,8 +14,8 @@ import type { Window } from "./window.ts";
  * The window a sheet hangs from: the one given, or the key window, the main window, or the
  * first **visible** window — never one that has been closed. `windows` still lists a closed
  * window that something holds, and a sheet hung from it brings it back on screen, frozen on its
- * last frame. `undefined` when no window is on screen, and the caller falls back to an
- * application-modal alert.
+ * last frame. `undefined` when no window is on screen, and the caller hangs the sheet from a
+ * transparent {@link hostWindow} instead.
  */
 function nativeWindow(w?: Window | any): any {
   if (w) return nativeOf(w);
@@ -32,6 +32,45 @@ function nativeWindow(w?: Window | any): any {
     if (candidate) return candidate;
   }
   return undefined;
+}
+
+/**
+ * A window to hang a sheet from when none is on screen: a borderless, transparent panel in the
+ * upper middle of the main screen, floating above other windows. The sheet drops from it like a
+ * standalone alert would, but in the ordinary run loop — `runModal` would freeze every timer in
+ * the process (a show's DMX clock included) for as long as the alert stayed up. Close it with
+ * {@link closeHost} when the sheet ends.
+ */
+function hostWindow(): any {
+  const screen = objc.NSScreen.mainScreen();
+  const frame = screen ? screen.visibleFrame() : { x: 0, y: 0, width: 1440, height: 900 };
+  const width = 460;
+  const rect = {
+    x: Number(frame.x) + (Number(frame.width) - width) / 2,
+    y: Number(frame.y) + Number(frame.height) * 0.72,
+    width,
+    height: 1,
+  };
+  // Borderless (0), buffered backing (2).
+  const panel = objc.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(rect, 0, 2, false);
+  panel.setOpaque_(false);
+  panel.setBackgroundColor_(objc.NSColor.clearColor());
+  panel.setHasShadow_(false);
+  panel.setReleasedWhenClosed_(false);
+  // NSFloatingWindowLevel: above the app's other windows, as an alert would be.
+  panel.setLevel_(3);
+  panel.orderFrontRegardless();
+  return panel;
+}
+
+/** Take a {@link hostWindow} away once its sheet has ended. */
+function closeHost(host: any): void {
+  try {
+    host.orderOut_(null);
+    host.close();
+  } catch {
+    // Already gone with the app.
+  }
 }
 
 export interface AlertOptions {
@@ -67,9 +106,13 @@ export function alert(options: AlertOptions): Promise<AlertResult> {
   if (options.suppressible) a.setShowsSuppressionButton_(true);
 
   const parent = nativeWindow(options.window);
+  // No window on screen: hang the alert from a transparent host instead — never runModal, which
+  // would freeze all of JavaScript (a show's clock included) until someone clicked.
+  const host = parent ? undefined : hostWindow();
   return new Promise<AlertResult>((resolve) => {
     // void (^)(NSModalResponse)  ->  NSModalResponse is NSInteger, "q"
     const handler = createBlock("v@?q", (response: number) => {
+      if (host) closeHost(host);
       const idx = Number(response) - ModalResponse.AlertFirstButton;
       const suppressed = options.suppressible
         ? Number(a.suppressionButton()?.state() ?? 0) === 1
@@ -81,16 +124,7 @@ export function alert(options: AlertOptions): Promise<AlertResult> {
       });
       queueMicrotask(() => handler.dispose());
     });
-    if (parent) {
-      a.beginSheetModalForWindow_completionHandler_(parent, handler);
-    } else {
-      // No window to attach to: fall back to a standalone modal. This *does*
-      // block JS, which is exactly why it is the last resort.
-      const r = Number(a.runModal());
-      const idx = r - ModalResponse.AlertFirstButton;
-      resolve({ button: idx, title: buttons[idx] ?? "", suppressed: false });
-      handler.dispose();
-    }
+    a.beginSheetModalForWindow_completionHandler_(parent ?? host, handler);
   });
 }
 
@@ -198,21 +232,19 @@ export function prompt(
   a.setAccessoryView_(field);
 
   const parent = nativeWindow(options.window);
+  const host = parent ? undefined : hostWindow();
   return new Promise<string | null>((resolve) => {
     const handler = createBlock("v@?q", (response: number) => {
+      if (host) closeHost(host);
       const ok = Number(response) === ModalResponse.AlertFirstButton;
       resolve(ok ? str(field.stringValue()) : null);
       queueMicrotask(() => handler.dispose());
     });
-    if (parent) {
-      a.beginSheetModalForWindow_completionHandler_(parent, handler);
-      // Give the field focus once the sheet is up.
-      queueMicrotask(() => parent.makeFirstResponder_(field));
-    } else {
-      const r = Number(a.runModal());
-      resolve(r === ModalResponse.AlertFirstButton ? str(field.stringValue()) : null);
-      handler.dispose();
-    }
+    // Hung from a transparent host when no window is on screen — never runModal (see alert).
+    const sheetParent = parent ?? host;
+    a.beginSheetModalForWindow_completionHandler_(sheetParent, handler);
+    // Give the field focus once the sheet is up.
+    queueMicrotask(() => sheetParent.makeFirstResponder_(field));
   });
 }
 

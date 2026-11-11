@@ -11,6 +11,7 @@ const SUITES = [
   "test/types-check.ts",
   "test/layout.ts",
   "test/chrome.ts",
+  "test/dialogs.ts",
   "test/metal.ts",
   "test/gpu.ts",
   "test/metalfx.ts",
