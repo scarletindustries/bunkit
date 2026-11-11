@@ -114,17 +114,41 @@ export class RenderPass {
   /**
    * Open a render pass on `commands`. With `samples`, the GPU writes its timestamps at the
    * start of the pass's vertex work and the end of its fragment work into that buffer.
+   *
+   * The pass descriptor and its attachment descriptors are let go as soon as the encoder exists
+   * (the encoder copies what it needs): each holds its attachment's texture, so a wrapper left
+   * for the garbage collector kept a released render target's memory alive until a collection —
+   * 128 MB a 4096² half-float target, measured, for as long as the collector chose.
    */
   constructor(commands: MTLObject, o: RenderPassOptions, samples?: PassSamples) {
     const descriptor = objc.MTLRenderPassDescriptor.renderPassDescriptor();
+    // Every wrapper made here that refers to an attachment, released once the encoder is open.
+    const made: MTLObject[] = [descriptor];
+    try {
+      this.native = RenderPass.#open(commands, descriptor, o, samples, made);
+    } finally {
+      for (const m of made) m?.dispose?.();
+    }
+  }
+
+  /**
+   * Fill `descriptor` from `o` (and `samples`) and open the encoder. Every wrapper it makes is
+   * pushed onto `made`, for the caller to release. Throws when Metal will not open the pass.
+   */
+  static #open(
+    commands: MTLObject, descriptor: MTLObject, o: RenderPassOptions, samples: PassSamples | undefined, made: MTLObject[],
+  ): MTLObject {
     const colors: ColorAttachment[] =
       o.color ? (Array.isArray(o.color) ? o.color : [o.color])
       : o.target ? [{ texture: o.target.color, clear: o.clear, resolve: o.target.resolve ?? undefined }]
       : [];
     const depth = o.depth ?? o.target?.depth ?? null;
 
+    const colorArray = descriptor.colorAttachments();
+    made.push(colorArray);
     colors.forEach((c, i) => {
-      const a = descriptor.colorAttachments().objectAtIndexedSubscript_(i);
+      const a = colorArray.objectAtIndexedSubscript_(i);
+      made.push(a);
       a.setTexture_(attachment(c.texture));
       if (c.level) a.setLevel_(c.level);
       if (c.slice) a.setSlice_(c.slice);
@@ -145,6 +169,7 @@ export class RenderPass {
 
     if (depth) {
       const d = descriptor.depthAttachment();
+      made.push(d);
       d.setTexture_(attachment(depth));
       if (o.depthSlice) d.setSlice_(o.depthSlice);
       d.setLoadAction_(o.loadDepth ? MTL.LoadAction.load : MTL.LoadAction.clear);
@@ -153,7 +178,9 @@ export class RenderPass {
     }
 
     if (samples) {
-      const a = descriptor.sampleBufferAttachments().objectAtIndexedSubscript_(0);
+      const sampleArray = descriptor.sampleBufferAttachments();
+      const a = sampleArray.objectAtIndexedSubscript_(0);
+      made.push(sampleArray, a);
       a.setSampleBuffer_(samples.buffer);
       a.setStartOfVertexSampleIndex_(samples.start);
       a.setEndOfFragmentSampleIndex_(samples.end);
@@ -166,7 +193,7 @@ export class RenderPass {
       );
     }
     if (o.label) encoder.setLabel_(o.label);
-    this.native = encoder;
+    return encoder;
   }
 
   pipeline(p: RenderPipeline): this {

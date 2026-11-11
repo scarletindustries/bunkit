@@ -992,5 +992,29 @@ kernel void shade(depth2d_array<float> maps [[texture(0)]],
   scene.dispose();
 }
 
+// --- a render pass lets go of its attachments once it is encoded ------------------------
+{
+  // A released render target's memory comes back at once: the pass's descriptors used to hold
+  // the texture until the garbage collector reached their wrappers.
+  const g = gpu();
+  const mb = () => Number(g.device.currentAllocatedSize()) / 1048576;
+  const before = mb();
+  const target = g.texture({
+    width: 4096, height: 4096, format: "rgba16float", storage: "private",
+    usage: ["renderTarget", "shaderRead"], label: "released target",
+  });
+  const depth = g.texture({ width: 4096, height: 4096, format: "depth32float", usage: ["renderTarget"], label: "released depth" });
+  g.submit((commands) => {
+    new Frame(commands, { time: 0, dt: 1 / 60, index: 0, width: 4096, height: 4096 })
+      .render({ color: { texture: target, clear: [0, 0, 0, 1] }, depth, label: "released" }, () => {});
+  });
+  const held = mb() - before;
+  target.native.dispose();
+  depth.native.dispose();
+  const after = mb() - before;
+  check("a render pass's attachments are freed as soon as they are released, not at a collection",
+    held > 150 && after < 8, { held, after });
+}
+
 console.log(failures === 0 ? "\nALL GPU TESTS PASSED" : `\n${failures} GPU FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);
