@@ -22,6 +22,7 @@ const SUITES = [
   "test/soak.ts",
   "test/perf.ts",
   "test/examples.ts",
+  "test/icon.ts",
 ];
 
 let failed = 0;

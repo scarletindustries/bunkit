@@ -61,6 +61,8 @@ bun run bundle examples/demo.ts --name "My App" --id com.example.myapp --icon ic
 open "dist/My App.app"
 ```
 
+`--icon` takes a 1024×1024 `.png`, a ready `.icns`, or an icon composer `.icon`, which xcode 26's `actool` compiles into the `Assets.car` macOS 26 draws as liquid glass (with an `.icns` beside it for older systems).
+
 a worker the app starts with `new Worker(new URL("./name.ts", import.meta.url))` has to be compiled in too, or it loads from source and fails in the app: pass it with `--worker src/name.ts` (or `workers` in a config). it lands at the root of the bundled file system under its own file name, which is where that url points in the binary.
 
 ### how?

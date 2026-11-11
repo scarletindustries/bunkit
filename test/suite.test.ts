@@ -23,6 +23,7 @@ const SUITES = [
   "test/soak.ts",
   "test/perf.ts",
   "test/examples.ts",
+  "test/icon.ts",
 ];
 
 for (const suite of SUITES) {

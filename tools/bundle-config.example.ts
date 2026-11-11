@@ -59,9 +59,11 @@ const config: BundleOptions = {
   out: "../dist",
 
   /**
-   * App icon. A .png (1024x1024 works best) is converted to .icns with sips and
-   * iconutil at the ten sizes Finder and the Dock ask for; a .icns is copied
-   * straight through. Omit for the generic application icon.
+   * App icon. An Icon Composer .icon is compiled with Xcode 26's actool into the
+   * Assets.car macOS 26 draws as Liquid Glass, plus an .icns for older systems. A
+   * .png (1024x1024 works best) is converted to .icns with sips and iconutil at
+   * the ten sizes Finder and the Dock ask for; a .icns is copied straight through.
+   * Omit for the generic application icon.
    */
   // icon: "../assets/icon.png",
 

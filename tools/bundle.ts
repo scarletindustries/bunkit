@@ -12,11 +12,13 @@
 //   MyApp.app/Contents/MacOS/MyApp            compiled Bun binary
 //   MyApp.app/Contents/Frameworks/libobjcbridge.dylib
 //   MyApp.app/Contents/Resources/AppIcon.icns
+//   MyApp.app/Contents/Resources/Assets.car       (from a .icon: the Liquid Glass icon)
 //
 // The one genuinely tricky part is making the compiled binary find the dylib —
 // see makeLauncher() below.
 
-import { existsSync, mkdirSync, rmSync, cpSync, chmodSync, writeFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, cpSync, chmodSync, writeFileSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
@@ -52,7 +54,12 @@ export interface BundleOptions {
   version?: string;
   /** CFBundleVersion — the build number. Defaults to `version`. */
   build?: string;
-  /** Icon source: a .png (converted with sips + iconutil) or a ready .icns. */
+  /**
+   * Icon source: an Icon Composer **.icon** (compiled with Xcode 26's `actool` into the
+   * `Assets.car` macOS 26 draws as Liquid Glass — Default, Dark, Clear and Tinted — plus an
+   * `.icns` for older systems; needs Xcode), a .png (converted with sips + iconutil), or a
+   * ready .icns.
+   */
   icon?: string;
   /** Directory the .app is written into. Default "dist". */
   out?: string;
@@ -273,6 +280,42 @@ const ICON_SIZES: Array<[name: string, px: number]> = [
   ["icon_512x512@2x", 1024],
 ];
 
+/**
+ * Compile an Icon Composer `.icon` into `resourcesDir`: `Assets.car`, which carries the
+ * layered Liquid Glass icon macOS 26 renders in each appearance, and `AppIcon.icns`, the
+ * flattened fallback older systems (and `CFBundleIconFile`) read. Both are named `AppIcon`
+ * whatever the source is called, because `actool --app-icon` names the asset after the
+ * `.icon` it is given. Side effects: writes the two files; uses a scratch directory under the
+ * system's temp folder, removed after. Throws, with actool's own message, when Xcode's
+ * `actool` is missing or refuses the file.
+ */
+export function compileIcon(src: string, resourcesDir: string, minimum: string, verbose: boolean): void {
+  const work = mkdtempSync(join(tmpdir(), "bunkit-icon-"));
+  try {
+    const named = join(work, "AppIcon.icon");
+    cpSync(src, named, { recursive: true });
+    const out = join(work, "out");
+    mkdirSync(out);
+    run(
+      [
+        "xcrun", "actool", named, "--compile", out, "--app-icon", "AppIcon",
+        "--enable-on-demand-resources", "NO", "--development-region", "en",
+        "--target-device", "mac", "--platform", "macosx",
+        "--minimum-deployment-target", minimum,
+        "--output-partial-info-plist", join(out, "partial.plist"),
+      ],
+      "actool (compiling a .icon needs Xcode 26)",
+    );
+    for (const file of ["Assets.car", "AppIcon.icns"]) {
+      if (!existsSync(join(out, file))) throw new Error(`actool made no ${file} from ${basename(src)}`);
+      cpSync(join(out, file), join(resourcesDir, file));
+    }
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+  log(verbose, `  icon      ${basename(src)} -> Assets.car + AppIcon.icns (actool)`);
+}
+
 function makeIcns(png: string, outIcns: string, verbose: boolean): void {
   const iconset = outIcns.replace(/\.icns$/, "") + ".iconset";
   rmSync(iconset, { recursive: true, force: true });
@@ -425,6 +468,8 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
 
   // --- icon ----------------------------------------------------------------
   let iconFile: string | null = null;
+  /** Whether the icon is also in Assets.car, named by `CFBundleIconName`. */
+  let iconAsset = false;
   if (options.icon) {
     const src = resolve(options.icon);
     if (!existsSync(src)) throw new Error(`icon not found: ${src}`);
@@ -435,8 +480,11 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
       log(verbose, `  icon      ${basename(src)} (copied)`);
     } else if (ext === ".png") {
       makeIcns(src, iconFile, verbose);
+    } else if (ext === ".icon") {
+      compileIcon(src, resourcesDir, options.minimumSystemVersion ?? "11.0", verbose);
+      iconAsset = true;
     } else {
-      throw new Error(`icon must be a .png or .icns, got ${ext || "no extension"}`);
+      throw new Error(`icon must be a .icon, .png or .icns, got ${ext || "no extension"}`);
     }
   }
 
@@ -467,6 +515,7 @@ export async function bundle(options: BundleOptions): Promise<BundleResult> {
     NSPrincipalClass: "NSApplication",
   };
   if (iconFile) info.CFBundleIconFile = "AppIcon";
+  if (iconAsset) info.CFBundleIconName = "AppIcon";
   if (options.category) info.LSApplicationCategoryType = options.category;
   if (options.copyright) info.NSHumanReadableCopyright = options.copyright;
   if (options.agent) info.LSUIElement = true;
