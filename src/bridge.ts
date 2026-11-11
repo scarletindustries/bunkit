@@ -141,6 +141,15 @@ export const lib = dlopen(LIB_PATH, {
   br_drawables_ready: { args: [OBJ], returns: I32 },
   br_drawables_take: { args: [OBJ], returns: OBJ },
   br_drawables_destroy: { args: [OBJ], returns: V },
+
+  br_library_compile: { args: [OBJ, BUF], returns: OBJ },
+  br_render_pipeline_compile: { args: [OBJ, OBJ, FFIType.u64], returns: OBJ },
+  br_compute_pipeline_compile: { args: [OBJ, OBJ, FFIType.u64], returns: OBJ },
+  br_compile_poll: { args: [OBJ], returns: I32 },
+  br_compile_take: { args: [OBJ], returns: OBJ },
+  br_compile_take_reflection: { args: [OBJ], returns: OBJ },
+  br_compile_error: { args: [OBJ], returns: OBJ },
+  br_compile_free: { args: [OBJ], returns: V },
   br_bundle_path: { args: [], returns: CSTR },
 }).symbols;
 

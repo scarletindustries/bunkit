@@ -15,6 +15,7 @@ const SUITES = [
   "test/chrome.ts",
   "test/metal.ts",
   "test/gpu.ts",
+  "test/compile.ts",
   "test/input.ts",
   "test/keys.ts",
   "test/runloop.ts",

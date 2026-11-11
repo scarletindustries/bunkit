@@ -180,6 +180,19 @@ int   br_drawables_ready(void* pump);
 void* br_drawables_take(void* pump);
 void  br_drawables_destroy(void* pump);
 
+// --- libraries and pipelines, compiled on Metal's threads (compile.m) ------
+// A job: poll it (0 compiling, 1 compiled, -1 failed), take the result (+1)
+// and a pipeline's reflection (+1, or NULL), or read the error (valid until
+// freed), and free it exactly once.
+void*       br_library_compile(void* device, const char* source);
+void*       br_render_pipeline_compile(void* device, void* descriptor, uint64_t options);
+void*       br_compute_pipeline_compile(void* device, void* function, uint64_t options);
+int         br_compile_poll(void* job);
+void*       br_compile_take(void* job);
+void*       br_compile_take_reflection(void* job);
+const char* br_compile_error(void* job);
+void        br_compile_free(void* job);
+
 #ifdef __cplusplus
 }
 #endif

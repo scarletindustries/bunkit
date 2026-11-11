@@ -7,7 +7,7 @@
 // escape hatch to raw Objective-C is one property away on every object.
 
 import { cfunction, objc, withPool, wrap } from "../objc.ts";
-import { NIL, ptr, toArrayBuffer, asPointer } from "../bridge.ts";
+import { NIL, ptr, toArrayBuffer, asPointer, cstr, lib, readCString } from "../bridge.ts";
 import {
   arrayOf,
   strideOf,
@@ -310,13 +310,20 @@ export class Shader {
   #functions = new Map<string, MTLObject>();
   #entries: { vertex: string[]; fragment: string[]; kernel: string[] } | null = null;
 
-  constructor(device: MTLObject, source: string, label = "shader") {
+  /**
+   * Compile `source` on this thread — or, given `library`, adopt one already compiled from it
+   * (a background compile's: see `GPU.shaderAsync`). Throws the compiler's message, with the
+   * offending line under it, when the source does not compile.
+   */
+  constructor(device: MTLObject, source: string, label = "shader", library?: MTLObject) {
     this.source = source;
     this.label = label;
-    const err = outError();
-    const library = device.newLibraryWithSource_options_error_(source, null, err.ptr);
-    if (!library || library.ptr === NIL) {
-      throw new Error(formatShaderError(err.message() ?? "no message", source, label));
+    if (!library) {
+      const err = outError();
+      library = device.newLibraryWithSource_options_error_(source, null, err.ptr);
+      if (!library || library.ptr === NIL) {
+        throw new Error(formatShaderError(err.message() ?? "no message", source, label));
+      }
     }
     library.setLabel_(label);
     this.native = library;
@@ -383,6 +390,83 @@ function formatShaderError(message: string, source: string, label: string): stri
     return line === undefined ? m : `${m}\n     | ${line}\n     | ${" ".repeat(Math.max(0, Number(c) - 1))}^`;
   });
   return `${label} failed to compile:\n${annotated}`;
+}
+
+// ---------------------------------------------------------------------------
+// Compiling without waiting
+// ---------------------------------------------------------------------------
+
+/**
+ * What a shader asked for inside {@link GPU.nonBlocking} throws when Metal has not compiled its
+ * source yet: the compile has been started on Metal's threads, and the work that wanted it should
+ * be tried again once {@link GPU.compiling} is back to 0. Recognise it with
+ * {@link isCompilePending} — the `name` is `"CompilePending"`, and so is the start of the message.
+ */
+export class CompilePending extends Error {
+  /** The shader's label. */
+  readonly label: string;
+
+  constructor(label: string) {
+    super(`CompilePending: ${label} is compiling in the background`);
+    this.name = "CompilePending";
+    this.label = label;
+  }
+}
+
+/**
+ * Whether `value` is a {@link CompilePending} — or says it is: one caught and logged as a string
+ * still reads as one. Pure.
+ */
+export function isCompilePending(value: unknown): boolean {
+  if (value instanceof CompilePending) return true;
+  return typeof value === "string" && value.includes("CompilePending: ");
+}
+
+/**
+ * A compile on Metal's threads: a library or a pipeline state. Queued until there is room for it
+ * (see {@link MAX_BACKGROUND_COMPILES}), then running until it settles.
+ */
+interface CompileJob {
+  /** What it is, for messages. */
+  label: string;
+  /** Start it: the native job (compile.m), or 0n if it could not be started. */
+  start: () => bigint;
+  /** The native job once started; `undefined` while queued. Freed exactly once, when settled. */
+  handle: bigint | undefined;
+  /** Everyone waiting on a library through {@link GPU.shaderAsync}. */
+  waiters: { resolve: (s: Shader) => void; reject: (e: Error) => void }[];
+}
+
+/** How often finished background compiles are looked for while any is running, ms. */
+const COMPILE_POLL_MS = 2;
+
+/**
+ * How long a compile inside `GPU.nonBlocking` is waited for before it is put off, ms. What Metal's
+ * shader cache has comes back in a fraction of this (a library or a pipeline state ≈ 0.1–0.5 ms
+ * through the completion handler); a real compile takes tens to hundreds. Without it, every
+ * pipeline of a warm build was a deferral and a retry.
+ */
+const COMPILE_GRACE_MS = 2;
+
+/**
+ * The most compiles running on Metal's threads at once; the rest wait their turn. Metal's
+ * compiler takes every core it is given: twenty libraries started together (a renderer's, after
+ * its shaders changed) left the thread that asked for them without a core for 20–60 ms at a time
+ * while they ran — the stall this exists to avoid, by another road. With two at a time there was
+ * no such gap, and the twenty took ≈ 3 s rather than ≈ 2 (on the thread itself, one after
+ * another, they were ≈ 5 s of nothing else running).
+ */
+export const MAX_BACKGROUND_COMPILES = 2;
+
+/** Whether a compile job has settled, checking until `ms` have passed. A queued job has not. */
+function settlesWithin(job: CompileJob, ms: number): boolean {
+  if (job.handle === undefined) return false;
+  if (job.handle === 0n) return true;
+  const until = performance.now() + ms;
+  do {
+    if ((lib.br_compile_poll(job.handle) as number) !== 0) return true;
+  } while (performance.now() < until);
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -649,6 +733,26 @@ const BLEND_PRESETS: Record<string, BlendSpec> = {
   premultiplied: { color: { src: "one", dst: "oneMinusSrcAlpha" }, alpha: { src: "one", dst: "oneMinusSrcAlpha" } },
 };
 
+/** A compiled pipeline state and the reflection it came with. */
+interface PipelineState {
+  native: MTLObject;
+  reflection: MTLObject | null;
+}
+
+/**
+ * Where a pipeline's state comes from (see `GPU.#state`): given the shader, a key for everything
+ * else that decides it, a label, how to compile it here, and how to start compiling it on Metal's
+ * threads (a native job, or 0). Returns the state, or throws as compiling it would — or throws
+ * {@link CompilePending}.
+ */
+type PipelineStates = (
+  shader: Shader,
+  key: string,
+  label: string,
+  here: () => PipelineState,
+  background: () => bigint,
+) => PipelineState;
+
 export interface RenderPipelineOptions {
   /** A compiled Shader, or MSL source to compile. */
   shader: Shader | string;
@@ -683,7 +787,12 @@ export class RenderPipeline {
   /** Every argument the shader takes, by name. See bind() on a pass. */
   readonly bindings: BindingTable;
 
-  constructor(device: MTLObject, o: RenderPipelineOptions, compile: (src: string) => Shader) {
+  /**
+   * Build the descriptor and compile the pipeline state — here, or (with `states`, which the GPU
+   * passes) wherever it says: a state compiled in the background, or a {@link CompilePending}
+   * thrown inside {@link GPU.nonBlocking}. Throws Metal's message when it does not compile.
+   */
+  constructor(device: MTLObject, o: RenderPipelineOptions, compile: (src: string) => Shader, states?: PipelineStates) {
     const shader = typeof o.shader === "string" ? compile(o.shader) : o.shader;
     this.shader = shader;
     const vertexName = o.vertex ?? shader.only("vertex");
@@ -720,19 +829,29 @@ export class RenderPipeline {
     if (depthFormat) d.setDepthAttachmentPixelFormat_(PixelFormat[depthFormat]);
     if (o.sampleCount && o.sampleCount > 1) d.setRasterSampleCount_(o.sampleCount);
 
-    const err = outError();
-    const reflection = new BigUint64Array(1);
     // ArgumentInfo | BufferTypeInfo: the names and the struct layouts. Asking
     // for them costs a little compile time once and saves index bookkeeping
     // for the life of the program.
-    const native = device.newRenderPipelineStateWithDescriptor_options_reflection_error_(
-      d, PipelineOption.argumentInfo | PipelineOption.bufferTypeInfo, ptr(reflection), err.ptr,
-    );
-    if (!native || native.ptr === NIL) {
-      throw new Error(`pipeline ${this.label}: ${err.message() ?? "unknown error"}`);
-    }
-    this.native = native;
-    this.bindings = renderBindings(reflection[0] ? wrap(reflection[0]!, false) : null);
+    const options = PipelineOption.argumentInfo | PipelineOption.bufferTypeInfo;
+    const here = (): PipelineState => {
+      const err = outError();
+      const reflection = new BigUint64Array(1);
+      const native = device.newRenderPipelineStateWithDescriptor_options_reflection_error_(
+        d, options, ptr(reflection), err.ptr,
+      );
+      if (!native || native.ptr === NIL) {
+        throw new Error(`pipeline ${this.label}: ${err.message() ?? "unknown error"}`);
+      }
+      return { native, reflection: reflection[0] ? wrap(reflection[0]!, false) : null };
+    };
+    // What decides the compiled state: the functions, the attachments and the blending. Cull,
+    // winding and depth testing are the encoder's, set at draw time.
+    const key = `render|${vertexName}|${fragmentName ?? ""}|${formats.join(",")}|${depthFormat ?? ""}|${JSON.stringify(blend ?? null)}|${o.sampleCount ?? 1}`;
+    const state = states
+      ? states(shader, key, this.label, here, () => lib.br_render_pipeline_compile(device.ptr, d.ptr, BigInt(options)) as bigint)
+      : here();
+    this.native = state.native;
+    this.bindings = renderBindings(state.reflection);
 
     if (o.depth === false || !depthFormat) {
       this.depthState = null;
@@ -764,7 +883,12 @@ export class ComputePipeline {
   readonly bindings: BindingTable;
   #gpu: GPU;
 
-  constructor(gpu: GPU, o: ComputePipelineOptions, compile: (src: string) => Shader) {
+  /**
+   * Compile the kernel's pipeline state — here, or (with `states`, which the GPU passes) wherever
+   * it says: a state compiled in the background, or a {@link CompilePending} thrown inside
+   * {@link GPU.nonBlocking}. Throws Metal's message when it does not compile.
+   */
+  constructor(gpu: GPU, o: ComputePipelineOptions, compile: (src: string) => Shader, states?: PipelineStates) {
     const device = gpu.device;
     this.#gpu = gpu;
     const shader = typeof o.shader === "string" ? compile(o.shader) : o.shader;
@@ -772,17 +896,25 @@ export class ComputePipeline {
     const entry = o.entry ?? shader.only("kernel");
     this.label = o.label ?? entry;
 
-    const err = outError();
-    const reflection = new BigUint64Array(1);
-    const native = device.newComputePipelineStateWithFunction_options_reflection_error_(
-      shader.fn(entry), PipelineOption.argumentInfo | PipelineOption.bufferTypeInfo,
-      ptr(reflection), err.ptr,
-    );
-    if (!native || native.ptr === NIL) {
-      throw new Error(`compute pipeline ${this.label}: ${err.message() ?? "unknown error"}`);
-    }
+    const options = PipelineOption.argumentInfo | PipelineOption.bufferTypeInfo;
+    const fn = shader.fn(entry);
+    const here = (): PipelineState => {
+      const err = outError();
+      const reflection = new BigUint64Array(1);
+      const native = device.newComputePipelineStateWithFunction_options_reflection_error_(
+        fn, options, ptr(reflection), err.ptr,
+      );
+      if (!native || native.ptr === NIL) {
+        throw new Error(`compute pipeline ${this.label}: ${err.message() ?? "unknown error"}`);
+      }
+      return { native, reflection: reflection[0] ? wrap(reflection[0]!, false) : null };
+    };
+    const state = states
+      ? states(shader, `compute|${entry}`, this.label, here, () => lib.br_compute_pipeline_compile(device.ptr, fn.ptr, BigInt(options)) as bigint)
+      : here();
+    const native = state.native;
     this.native = native;
-    this.bindings = computeBindings(reflection[0] ? wrap(reflection[0]!, false) : null);
+    this.bindings = computeBindings(state.reflection);
     this.maxThreads = Number(native.maxTotalThreadsPerThreadgroup());
     this.threadExecutionWidth = Number(native.threadExecutionWidth());
   }
@@ -862,23 +994,323 @@ export class GPU {
     return buf;
   }
 
-  /** Compile MSL. Identical source is compiled once. */
+  /**
+   * Compile MSL. Identical source is compiled once.
+   *
+   * On this thread, and it waits: a source Metal's shader cache has seen is a fraction of a
+   * millisecond, one it has not — the first run after the source changed — can be hundreds. Inside
+   * {@link nonBlocking}, a source not compiled yet is started on Metal's threads instead and this
+   * throws {@link CompilePending}. A source whose background compile failed throws its compile
+   * error, as compiling it here would.
+   */
   shader(source: string, options: { label?: string; cache?: boolean } = {}): Shader {
     if (options.cache === false) return new Shader(this.device, source, options.label);
     let s = this.#shaders.get(source);
-    if (!s) {
-      s = new Shader(this.device, source, options.label);
-      this.#shaders.set(source, s);
+    if (s) return s;
+    if (this.#jobs.size > 0) {
+      this.#poll();
+      s = this.#shaders.get(source);
+      if (s) return s;
     }
+    const failed = this.#failed.get(source);
+    if (failed !== undefined) throw new Error(formatShaderError(failed, source, options.label ?? "shader"));
+    if (this.#nonBlocking > 0) {
+      // Metal answers a source its cache has seen in well under a millisecond: wait that long
+      // for it, so only a real compile is put off.
+      const job = this.#start(source, options.label ?? "shader");
+      if (settlesWithin(job, this.#grace())) {
+        this.#poll();
+        s = this.#shaders.get(source);
+        if (s) return s;
+        const failedNow = this.#failed.get(source);
+        if (failedNow !== undefined) throw new Error(formatShaderError(failedNow, source, options.label ?? "shader"));
+      }
+      this.#deferred++;
+      this.#scopeDeferred = true;
+      throw new CompilePending(options.label ?? "shader");
+    }
+    // A background compile of this source may be under way; compiling it here is still right —
+    // what it finishes with is dropped (see #poll), and the caller is not kept waiting on a poll.
+    s = new Shader(this.device, source, options.label);
+    this.#shaders.set(source, s);
     return s;
   }
 
-  renderPipeline(o: RenderPipelineOptions): RenderPipeline {
-    return new RenderPipeline(this.device, o, (src) => this.shader(src, { label: o.label }));
+  /** Background library compiles under way, by source. */
+  readonly #jobs = new Map<string, CompileJob>();
+  /** Sources whose background compile failed, and the compiler's message. */
+  readonly #failed = new Map<string, string>();
+  /** Background pipeline-state compiles under way, by {@link #stateKey}. */
+  readonly #stateJobs = new Map<string, CompileJob>();
+  /** Compiles waiting for room to start, oldest first, and how many are running. */
+  readonly #queue: CompileJob[] = [];
+  #running = 0;
+  /**
+   * Pipeline states compiled in the background, by {@link #stateKey}: what a pipeline asked for
+   * again, once one is ready, is made from. Kept for the GPU's life — a state is a few hundred
+   * bytes, and the same pipeline asked for again (a renderer rebuilt) is made at once.
+   */
+  readonly #states_ = new Map<string, PipelineState>();
+  /** Pipeline states whose background compile failed, and Metal's message. */
+  readonly #stateFailed = new Map<string, string>();
+  /** Depth of {@link nonBlocking} calls on the stack. */
+  #nonBlocking = 0;
+  /** Compiles {@link nonBlocking} has deferred, ever. */
+  #deferred = 0;
+  /** The poll timer, while any compile is running. */
+  #pollTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /**
+   * Compile MSL on Metal's threads, and resolve with the {@link Shader} — the same object
+   * {@link shader} returns for this source from then on. Already compiled, it resolves at once;
+   * already compiling, it joins that compile. Rejects with the compiler's message if the source
+   * does not compile.
+   *
+   * Side effects: starts the compile and, while any is running, polls for it every couple of
+   * milliseconds on this thread (a pump blocked in AppKit is woken when one finishes). Nothing
+   * runs on another thread but Metal's compiler.
+   */
+  shaderAsync(source: string, options: { label?: string } = {}): Promise<Shader> {
+    const ready = this.#shaders.get(source);
+    if (ready) return Promise.resolve(ready);
+    const failed = this.#failed.get(source);
+    if (failed !== undefined) return Promise.reject(new Error(formatShaderError(failed, source, options.label ?? "shader")));
+    return new Promise((resolve, reject) => {
+      this.#start(source, options.label ?? "shader").waiters.push({ resolve, reject });
+    });
   }
 
+  /**
+   * Run `fn`, and have anything it compiles that Metal has not compiled yet — a shader library
+   * ({@link shader}) or a pipeline's state ({@link renderPipeline}, {@link computePipeline}) — start
+   * compiling on Metal's threads and throw {@link CompilePending}, rather than compile on this
+   * thread. For work that can be put off and tried again: building a renderer a stage at a time
+   * between the frames of a window, on a thread that has a clock to keep. Nests. Returns what
+   * `fn` returns.
+   *
+   * Side effects: as {@link shader} inside it; counts every deferral in {@link deferred}, so
+   * work that caught a {@link CompilePending} itself and carried on can be told from work that
+   * did not need to wait.
+   */
+  nonBlocking<T>(fn: () => T): T {
+    if (this.#nonBlocking === 0) this.#scopeDeferred = false;
+    this.#nonBlocking++;
+    try {
+      return fn();
+    } finally {
+      this.#nonBlocking--;
+    }
+  }
+
+  /** Whether the outermost {@link nonBlocking} running now has put a compile off already. */
+  #scopeDeferred = false;
+
+  /**
+   * How long to wait for a compile inside {@link nonBlocking} before putting it off: the grace,
+   * unless this scope has put one off already — the work will be tried again whatever happens,
+   * so a wait for a second compile is time spent for nothing.
+   */
+  #grace(): number {
+    return this.#scopeDeferred ? 0 : COMPILE_GRACE_MS;
+  }
+
+  /**
+   * How many libraries and pipeline states are compiling in the background now. Reading it
+   * collects the ones that have finished, so polling it is how a caller waits without blocking.
+   */
+  get compiling(): number {
+    if (this.#jobs.size + this.#stateJobs.size > 0) this.#poll();
+    return this.#jobs.size + this.#stateJobs.size;
+  }
+
+  /** How many compiles {@link nonBlocking} has deferred since this GPU was made. */
+  get deferred(): number {
+    return this.#deferred;
+  }
+
+  /** Compile `source` in the background (when there is room), or join the compile already asked for. */
+  #start(source: string, label: string): CompileJob {
+    let job = this.#jobs.get(source);
+    if (job) return job;
+    const device = this.device.ptr;
+    job = { label, waiters: [], handle: undefined, start: () => lib.br_library_compile(device, ptr(cstr(source))) as bigint };
+    this.#jobs.set(source, job);
+    this.#launch(job);
+    return job;
+  }
+
+  /** Start `job` now if fewer than {@link MAX_BACKGROUND_COMPILES} are running, else queue it. */
+  #launch(job: CompileJob): void {
+    if (this.#running < MAX_BACKGROUND_COMPILES) {
+      job.handle = job.start();
+      this.#running++;
+    } else {
+      this.#queue.push(job);
+    }
+    this.#schedulePoll();
+  }
+
+  /** Shaders' numbers, for keying pipeline states by the library they come from. */
+  readonly #shaderIds = new WeakMap<Shader, number>();
+  #nextShaderId = 1;
+
+  /** A pipeline state's key: the shader it comes from and everything else that decides it. */
+  #stateKey(shader: Shader, key: string): string {
+    let id = this.#shaderIds.get(shader);
+    if (id === undefined) {
+      id = this.#nextShaderId++;
+      this.#shaderIds.set(shader, id);
+    }
+    return `${id}|${key}`;
+  }
+
+  /**
+   * Where every pipeline this GPU makes gets its state (see `PipelineStates`): one compiled in the
+   * background if there is one; inside {@link nonBlocking}, a background compile started (or
+   * joined) and {@link CompilePending} thrown; otherwise compiled here, as always.
+   */
+  readonly #states: PipelineStates = (shader, key, label, here, background) => {
+    const full = this.#stateKey(shader, key);
+    if (this.#stateJobs.size > 0) this.#poll();
+    const ready = this.#states_.get(full);
+    if (ready) return ready;
+    const failed = this.#stateFailed.get(full);
+    if (failed !== undefined) throw new Error(`pipeline ${label}: ${failed}`);
+    if (this.#nonBlocking === 0) return here();
+    let job = this.#stateJobs.get(full);
+    if (!job) {
+      job = { label, waiters: [], handle: undefined, start: background };
+      this.#stateJobs.set(full, job);
+      this.#launch(job);
+    }
+    // As for a library: what Metal's cache has is back in well under a millisecond.
+    if (settlesWithin(job, this.#grace())) {
+      this.#poll();
+      const now = this.#states_.get(full);
+      if (now) return now;
+      const failedNow = this.#stateFailed.get(full);
+      if (failedNow !== undefined) throw new Error(`pipeline ${label}: ${failedNow}`);
+    }
+    this.#deferred++;
+    this.#scopeDeferred = true;
+    throw new CompilePending(label);
+  };
+
+  /** Keep polling while anything compiles. */
+  #schedulePoll(): void {
+    if (this.#pollTimer !== undefined || this.#jobs.size + this.#stateJobs.size === 0) return;
+    this.#pollTimer = setTimeout(() => {
+      this.#pollTimer = undefined;
+      this.#poll();
+      this.#schedulePoll();
+    }, COMPILE_POLL_MS);
+  }
+
+  /**
+   * Settle every background compile that has finished: a library goes into the shader cache
+   * (unless one was compiled meanwhile) and a pipeline state into {@link #states_}; a failure is
+   * remembered, to be thrown as compiling it here would have; waiters are told. Then start what
+   * was queued, as there is room. Never throws.
+   */
+  #poll(): void {
+    for (const [source, job] of this.#jobs) {
+      const state = this.#settled(job);
+      if (state === 0) continue;
+      this.#jobs.delete(source);
+      if (state === 1) {
+        const library = wrap(lib.br_compile_take(job.handle!) as bigint, true);
+        let shader = this.#shaders.get(source);
+        if (!shader && library) {
+          shader = new Shader(this.device, source, job.label, library);
+          this.#shaders.set(source, shader);
+          this.#prefetchKernels(shader);
+        }
+        if (shader) for (const w of job.waiters) w.resolve(shader);
+        else for (const w of job.waiters) w.reject(new Error(`${job.label}: the compiled library was empty`));
+      } else {
+        const message = job.handle === 0n
+          ? "the compile could not be started"
+          : readCString(lib.br_compile_error(job.handle!) as bigint) || "no message";
+        this.#failed.set(source, message);
+        for (const w of job.waiters) w.reject(new Error(formatShaderError(message, source, job.label)));
+      }
+      this.#finish(job);
+    }
+    for (const [key, job] of this.#stateJobs) {
+      const state = this.#settled(job);
+      if (state === 0) continue;
+      this.#stateJobs.delete(key);
+      if (state === 1) {
+        const native = wrap(lib.br_compile_take(job.handle!) as bigint, true);
+        const reflection = wrap(lib.br_compile_take_reflection(job.handle!) as bigint, true);
+        if (native) this.#states_.set(key, { native, reflection });
+        else this.#stateFailed.set(key, "the compiled state was empty");
+      } else {
+        this.#stateFailed.set(key, job.handle === 0n
+          ? "the compile could not be started"
+          : readCString(lib.br_compile_error(job.handle!) as bigint) || "unknown error");
+      }
+      this.#finish(job);
+    }
+    while (this.#running < MAX_BACKGROUND_COMPILES && this.#queue.length > 0) {
+      const next = this.#queue.shift()!;
+      next.handle = next.start();
+      this.#running++;
+    }
+  }
+
+  /**
+   * Start compiling, in the background, the pipeline state of every kernel in a library that has
+   * just been compiled in the background. A compute pipeline's state depends on nothing but its
+   * function, so it can be had before anyone asks — and after a shader changes, its states are as
+   * new to Metal as its library: one asked for at a time, a library of twelve kernels was twelve
+   * deferrals and a build tried thirteen times. Render pipelines depend on the attachments they
+   * draw to and wait to be asked. Never throws.
+   */
+  #prefetchKernels(shader: Shader): void {
+    try {
+      const device = this.device.ptr;
+      for (const entry of shader.entries.kernel) {
+        const key = this.#stateKey(shader, `compute|${entry}`);
+        if (this.#states_.has(key) || this.#stateJobs.has(key) || this.#stateFailed.has(key)) continue;
+        const fn = shader.fn(entry);
+        const options = BigInt(PipelineOption.argumentInfo | PipelineOption.bufferTypeInfo);
+        const job: CompileJob = {
+          label: entry, waiters: [], handle: undefined,
+          start: () => lib.br_compute_pipeline_compile(device, fn.ptr, options) as bigint,
+        };
+        this.#stateJobs.set(key, job);
+        this.#launch(job);
+      }
+    } catch {
+      // A library whose functions cannot be listed is compiled as it is asked for instead.
+    }
+  }
+
+  /** A job's state: 0 queued or compiling, 1 compiled, -1 failed (or never started). */
+  #settled(job: CompileJob): number {
+    if (job.handle === undefined) return 0;
+    if (job.handle === 0n) return -1;
+    return lib.br_compile_poll(job.handle) as number;
+  }
+
+  /** A settled job: free its native half and make room for the next. */
+  #finish(job: CompileJob): void {
+    if (job.handle !== undefined && job.handle !== 0n) lib.br_compile_free(job.handle);
+    this.#running--;
+  }
+
+  /**
+   * A render pipeline. Its source is compiled through {@link shader} and its state here, or —
+   * inside {@link nonBlocking} — on Metal's threads, throwing {@link CompilePending} until it is.
+   */
+  renderPipeline(o: RenderPipelineOptions): RenderPipeline {
+    return new RenderPipeline(this.device, o, (src) => this.shader(src, { label: o.label }), this.#states);
+  }
+
+  /** A compute pipeline; compiled as {@link renderPipeline} is. */
   computePipeline(o: ComputePipelineOptions): ComputePipeline {
-    return new ComputePipeline(this, o, (src) => this.shader(src, { label: o.label }));
+    return new ComputePipeline(this, o, (src) => this.shader(src, { label: o.label }), this.#states);
   }
 
   /**

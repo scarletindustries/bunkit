@@ -14,6 +14,7 @@ const SUITES = [
   "test/dialogs.ts",
   "test/metal.ts",
   "test/gpu.ts",
+  "test/compile.ts",
   "test/metalfx.ts",
   "test/timer.ts",
   "test/input.ts",
