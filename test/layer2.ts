@@ -202,6 +202,30 @@ Bun.gc(true);
 const after = stats().live;
 check("wrappers are collected", after < before + 500, `${before} -> ${after}`);
 
+// --- a stateless delegate outlives its wrapper ------------------------------
+// A view AppKit is still tearing down can be asked something after its wrapper is collected. A
+// stateless delegate answers from its class instead of answering nothing.
+let survivor = 0n;
+(() => {
+  const flipped = createDelegate(
+    { isFlipped: () => true },
+    { superclass: "NSView", name: "StatelessProbe", types: { isFlipped: "B@:" }, stateless: true },
+  );
+  flipped.retain();
+  survivor = flipped.ptr;
+})();
+Bun.gc(true);
+await new Promise((r) => setTimeout(r, 20));
+Bun.gc(true);
+const warned: string[] = [];
+const warn = console.warn;
+console.warn = (...args: any[]) => warned.push(args.join(" "));
+const again = wrap(survivor);
+check("a stateless delegate answers after its wrapper is collected", Boolean(again.isFlipped()));
+check("and does not warn", warned.length === 0, warned);
+console.warn = warn;
+again.release();
+
 console.log("\nstats:", stats());
 console.log(failures === 0 ? "\nALL LAYER 2 TESTS PASSED" : `\n${failures} FAILURE(S)`);
 win.close();

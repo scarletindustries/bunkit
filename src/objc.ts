@@ -931,6 +931,11 @@ interface MethodSlot {
   types: string;
   isBlock: boolean;
   fn?: (...a: any[]) => any; // blocks carry their own function
+  /**
+   * A stateless delegate's handler, kept with its class: what answers when an instance's own
+   * handlers have been collected. See {@link DelegateOptions.stateless}.
+   */
+  fallback?: (...a: any[]) => any;
 }
 
 const methodSlots: MethodSlot[] = [
@@ -995,6 +1000,12 @@ const dispatchCallback = new JSCallback(
       let self: any;
       if (!slot.isBlock) {
         const table = instanceHandlers[instToken]?.deref();
+        if (table === undefined && slot.fallback) {
+          // A stateless delegate outliving its wrapper — a view AppKit is still tearing down —
+          // answers from its class, as a hand-written method would.
+          encodeReturn(slot, retbuf, slot.fallback.apply(undefined, decodeArgs(slot, argbuf)));
+          return;
+        }
         if (table === undefined) {
           // The delegate's JS side has been collected while Obj-C still holds
           // the object. Nothing sensible to call; say so rather than silently
@@ -1041,6 +1052,14 @@ export interface DelegateOptions {
   superclass?: string;
   /** Base name used for the generated Obj-C class. */
   name?: string;
+  /**
+   * Every handler is a constant answer that needs no instance — a view that says it is flipped.
+   * They are kept with the class as well as the instance, so an object whose JavaScript wrapper
+   * has been collected while AppKit still holds it (a view being torn down after its owner let
+   * go) still answers, rather than answering nothing and warning. Only for handlers that capture
+   * nothing: the first set given for a class answers for every instance of it.
+   */
+  stateless?: boolean;
 }
 
 // Searched by default so most delegates need no configuration at all.
@@ -1122,7 +1141,9 @@ export function createDelegate(
   const protocols = [...(options.protocols ?? []), ...DEFAULT_PROTOCOLS];
   const superclass = options.superclass ?? "NSObject";
   const selectors = Object.keys(handlers).map(toSelector).sort();
-  const shapeKey = `${superclass}|${(options.protocols ?? []).join(",")}|${selectors.join(",")}`;
+  const shapeKey =
+    `${superclass}|${(options.protocols ?? []).join(",")}|${selectors.join(",")}` +
+    (options.stateless ? "|stateless" : "");
 
   let shape = shapeCache.get(shapeKey);
   if (!shape) {
@@ -1141,12 +1162,14 @@ export function createDelegate(
         );
       }
       const token = methodSlots.length;
+      const handler = Object.entries(handlers).find(([key]) => toSelector(key) === selector)?.[1];
       methodSlots.push({
         selector,
         layout: sigLayout(types),
         split: splitEncoding(types),
         types,
         isBlock: false,
+        ...(options.stateless && handler ? { fallback: handler } : {}),
       });
       const rc = lib.br_class_add_method(
         cls, selFor(selector), cstrCached(types), dispatchCallback.ptr, token, 0,

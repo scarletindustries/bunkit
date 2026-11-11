@@ -227,11 +227,15 @@ export interface ScrollOptions extends ViewOptions {
   fitWidth?: boolean;
 }
 
-/** A plain view that says it is flipped — the document of a {@link ScrollView}. */
+/**
+ * A plain view that says it is flipped — the document of a {@link ScrollView}. Stateless, so a
+ * document AppKit is still tearing down after its scroll view's wrapper was collected still says
+ * so, rather than warning that its handlers are gone.
+ */
 function flippedDocument(): any {
   return createDelegate(
     { isFlipped: () => true },
-    { superclass: "NSView", name: "FlippedDocument", types: { isFlipped: "B@:" } },
+    { superclass: "NSView", name: "FlippedDocument", types: { isFlipped: "B@:" }, stateless: true },
   );
 }
 

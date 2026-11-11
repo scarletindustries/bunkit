@@ -5,7 +5,7 @@
 // and the inspector sits edge to edge because NSSplitViewController makes them so, and the
 // content runs under both when it is asked to. The wrappers only turn AppKit's
 // delegate-and-controller shapes into objects you build once and hold.
-import { createDelegate, globalObject, objc, str } from "../objc.ts";
+import { createDelegate, globalObject, objc, str, wrap } from "../objc.ts";
 import { ACTION_SELECTOR, actionTarget, toNSColor, View, type ViewOptions } from "./view.ts";
 import { Container } from "./layout.ts";
 import type { Window } from "./window.ts";
@@ -78,6 +78,106 @@ export class SymbolView extends View {
   }
 }
 
+/** How {@link SymbolTile} draws. */
+export interface SymbolTileOptions extends ViewOptions {
+  /** The tile's colour — a name, hex, or `NSColor`. Default grey. */
+  color?: any;
+  /** The tile's side, in points. Default 20, as a settings sidebar draws them. */
+  size?: number;
+  /** The corner radius, in points. Default a quarter of the side. */
+  radius?: number;
+  /** The symbol's point size. Default 60% of the side. */
+  symbolSize?: number;
+  /** The symbol's weight. Default `"medium"`. */
+  weight?: SymbolWeight;
+  /**
+   * Shade the fill from a little lighter at the top to the colour at the bottom, as System
+   * Settings' icons are. Default `true`; `false` is a flat fill.
+   */
+  gradient?: boolean;
+}
+
+/**
+ * A white SF Symbol on a rounded square of colour — the icon System Settings puts beside each
+ * pane in its sidebar.
+ *
+ * The square is a layer with a continuous ("squircle") corner, filled with a vertical gradient
+ * from the colour lightened by an eighth to the colour itself; the symbol is centred over it and
+ * drawn white. Fixed size: it is an icon, not something to stretch. A symbol this system does
+ * not have leaves the tile empty rather than throwing (see {@link symbol}).
+ */
+export class SymbolTile extends View {
+  readonly #symbol: any;
+  readonly #fill: any;
+  readonly #gradient: boolean;
+  readonly #options: SymbolTileOptions;
+
+  constructor(name: string, options: SymbolTileOptions = {}) {
+    const side = options.size ?? 20;
+    const native = objc.NSView.alloc().initWithFrame_({ x: 0, y: 0, width: side, height: side });
+    super(native, { ...options, width: side, height: side });
+    this.#options = options;
+    this.#gradient = options.gradient !== false;
+    native.setWantsLayer_(true);
+    const layer = native.layer();
+    layer.setCornerRadius_(options.radius ?? side / 4);
+    layer.setCornerCurve_("continuous");
+    layer.setMasksToBounds_(true);
+    this.#fill = objc.CAGradientLayer.layer();
+    this.#fill.setFrame_({ x: 0, y: 0, width: side, height: side });
+    layer.addSublayer_(this.#fill);
+    this.color = options.color ?? "gray";
+
+    const image = objc.NSImageView.alloc().init();
+    image.setTranslatesAutoresizingMaskIntoConstraints_(false);
+    image.setContentTintColor_(objc.NSColor.whiteColor());
+    native.addSubview_(image);
+    for (const attr of [C.NSLayoutAttributeCenterX, C.NSLayoutAttributeCenterY]) {
+      const c = objc.NSLayoutConstraint.constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant_(
+        image, attr, 0, native, attr, 1.0, 0,
+      );
+      c.setActive_(true);
+      this.retainJS(c);
+    }
+    this.#symbol = image;
+    this.retainJS(image);
+    this.name = name;
+    this.native.setContentHuggingPriority_forOrientation_(750, 0);
+    this.native.setContentHuggingPriority_forOrientation_(750, 1);
+  }
+
+  /** Show a different symbol, at the tile's size and weight. */
+  set name(name: string) {
+    const side = this.#options.size ?? 20;
+    const image = symbol(name, {
+      size: this.#options.symbolSize ?? Math.round(side * 0.6),
+      weight: this.#options.weight ?? "medium",
+    });
+    this.#symbol.setImage_(image ?? null);
+  }
+
+  /** The symbol's image, or `null` for a symbol this system does not have. For tests. */
+  get image(): any {
+    const image = this.#symbol.image();
+    return image && image.ptr !== 0n ? image : null;
+  }
+
+  /** Recolour the tile — a name, hex, or `NSColor`. */
+  set color(color: any) {
+    const base = toNSColor(color) ?? objc.NSColor.systemGrayColor();
+    // In sRGB, so the blend is of the colour a person sees rather than of a catalogue colour.
+    const solid = base.colorUsingColorSpace_(objc.NSColorSpace.sRGBColorSpace()) ?? base;
+    const top = this.#gradient
+      ? (solid.blendedColorWithFraction_ofColor_(0.125, objc.NSColor.whiteColor()) ?? solid)
+      : solid;
+    // Bottom first: a layer's y runs up in AppKit, so the gradient's start is the bottom edge.
+    const colors = objc.NSMutableArray.array();
+    colors.addObject_(wrap(solid.send("CGColor")));
+    colors.addObject_(wrap(top.send("CGColor")));
+    this.#fill.setColors_(colors);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Toolbar
 // ---------------------------------------------------------------------------
@@ -99,6 +199,11 @@ interface ToolbarItemBase {
   label: string;
   tooltip?: string;
   visibility?: ToolbarVisibility;
+  /**
+   * A navigation control — back and forward. AppKit puts it at the leading edge of the content,
+   * **before** the window's title, as System Settings and Finder draw theirs.
+   */
+  navigational?: boolean;
 }
 
 /** A button: a symbol, or a title, or both. */
@@ -474,6 +579,7 @@ export class Toolbar {
     }
     if (spec.tooltip) native.setToolTip_(spec.tooltip);
     if (spec.visibility) native.setVisibilityPriority_(VISIBILITY[spec.visibility]);
+    if (spec.navigational) native.setNavigational_(true);
     // Enabled is ours to say ({@link ToolbarItem.enabled}, `enableSegment`). Left on, AppKit's
     // validation pass re-enables a disabled segment a few times a second and the next sync
     // disables it again — a button that flickers between lit and grey.
@@ -497,6 +603,12 @@ export interface PaneWidth {
   max?: number;
   /** Start collapsed. */
   collapsed?: boolean;
+  /**
+   * Whether the pane can be collapsed at all — by a toolbar button, a menu command or dragging
+   * its divider shut. Default AppKit's: yes. `false` for a sidebar that *is* the window's
+   * navigation, as a settings window's is.
+   */
+  collapsible?: boolean;
 }
 
 /** Options for {@link SplitLayout}. */
@@ -691,6 +803,7 @@ function applyWidth(item: any, width: PaneWidth): void {
   if (width.min !== undefined) item.setMinimumThickness_(width.min);
   if (width.max !== undefined) item.setMaximumThickness_(width.max);
   if (width.collapsed !== undefined) item.setCollapsed_(width.collapsed);
+  if (width.collapsible !== undefined) item.setCanCollapse_(width.collapsible);
 }
 
 // ---------------------------------------------------------------------------

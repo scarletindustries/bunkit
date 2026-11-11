@@ -9,7 +9,9 @@ import {
   Label,
   Popover,
   ScrollView,
+  SearchField,
   SplitLayout,
+  SymbolTile,
   SymbolView,
   Table,
   Toolbar,
@@ -43,6 +45,43 @@ check("one that does not is null, not a throw", symbol("no.such.symbol.anywhere"
 check("a sized symbol is an image", symbol("play.fill", { size: 20, weight: "bold" }) !== null);
 const sv = new SymbolView("checkmark.circle.fill", { color: "green" });
 check("a symbol view holds its image", sv.native.image() !== null);
+
+console.log("symbol tiles");
+const tile = new SymbolTile("gearshape.fill", { color: "gray" });
+const tileFrame = () => {
+  tile.native.layoutSubtreeIfNeeded();
+  return tile.native.fittingSize();
+};
+check("a tile is 20 points square, as a sidebar's are", Math.round(Number(tileFrame().width)) === 20 && Math.round(Number(tileFrame().height)) === 20, tileFrame());
+check("it holds its symbol", tile.image !== null);
+check("drawn white", Boolean(tile.native.subviews().objectAtIndex_(0).contentTintColor().isEqual_(objc.NSColor.whiteColor())));
+check("on a rounded square", Number(tile.native.layer().cornerRadius()) === 5);
+check("with a gradient of two colours", Number(tile.native.layer().sublayers().objectAtIndex_(0).colors().count()) === 2);
+tile.color = "#ff0000";
+check("and can be recoloured", Number(tile.native.layer().sublayers().objectAtIndex_(0).colors().count()) === 2);
+const missing = new SymbolTile("no.such.symbol.anywhere", { color: "blue", size: 32 });
+check("a symbol the system lacks leaves the tile empty, not a throw", missing.image === null);
+check("and a tile can be any size", Math.round(Number(missing.native.fittingSize().width)) === 32);
+
+console.log("search fields");
+const typed: string[] = [];
+const submitted: string[] = [];
+const search = new SearchField({ onChange: (v) => typed.push(v), onSubmit: (v) => submitted.push(v) });
+check("the placeholder is macOS's own word", String(search.native.placeholderString()) === "Search");
+check("it is a real NSSearchField", Boolean(search.native.isKindOfClass_(objc.NSSearchField)));
+search.native.setStringValue_("mid");
+search.native.delegate().controlTextDidChange_(null);
+check("typing is a change", typed.join("|") === "mid", typed);
+search.native.delegate().controlTextDidChange_(null);
+check("the same text twice is one change", typed.length === 1, typed);
+search.native.setStringValue_("");
+search.native.sendAction_to_(search.native.action(), search.native.target());
+check("the clear button is a change too", typed.join("|") === "mid|", typed);
+search.value = "dmx";
+check("setting it from code fires nothing", typed.length === 2 && search.value === "dmx");
+const handled = search.native.delegate().control_textView_doCommandBySelector_(search.native, null, "insertNewline:");
+check("Return is taken, and submits", Boolean(handled) && submitted.join("|") === "dmx", submitted);
+check("another command is left to the field", !search.native.delegate().control_textView_doCommandBySelector_(search.native, null, "moveUp:"));
 
 console.log("toolbar");
 const clicks: string[] = [];
@@ -79,6 +118,7 @@ const toolbar = new Toolbar({
       onSelect: (i, sel) => clicks.push(`switches:${i}:${sel.join(",")}`),
     },
     { kind: "button", id: "live", label: "Live", title: "Live", onClick: () => clicks.push("live") },
+    { kind: "button", id: "back", label: "Back", symbol: "chevron.left", navigational: true },
     "inspectorSeparator",
     "toggleInspector",
   ],
@@ -90,7 +130,7 @@ const content = new Container({ background: "#101018" });
 const inspector = new VStack({ padding: 12 }, [new Label({ text: "Inspector" })]);
 const strip = new Label({ text: "the strip" });
 const split = new SplitLayout({
-  sidebar: { view: sidebar, min: 220, max: 300 },
+  sidebar: { view: sidebar, min: 220, max: 300, collapsible: false },
   content,
   inspector: { view: inspector, min: 300, max: 300 },
   contentAccessory: strip,
@@ -108,7 +148,11 @@ split.attach(win);
 pump();
 
 check("the toolbar is the window's", win.native.toolbar()?.ptr === toolbar.native.ptr);
-check("every item made it in", Number(toolbar.native.items().count()) === 10, Number(toolbar.native.items().count()));
+check("every item made it in", Number(toolbar.native.items().count()) === 11, Number(toolbar.native.items().count()));
+check("a navigational item says so", Boolean(toolbar.item("back").native.isNavigational()));
+check("an ordinary one does not", !toolbar.item("live").native.isNavigational());
+check("a sidebar can be made uncollapsible", !split.sidebarItem.canCollapse());
+check("an inspector is collapsible unless it says otherwise", Boolean(split.inspectorItem.canCollapse()));
 check("the subtitle is set", win.subtitle === "Following the stage Mac");
 win.subtitle = "Standby";
 check("and can change", win.subtitle === "Standby");
@@ -272,6 +316,28 @@ check("the title is in title case, as given", title.text === "Audio");
 check("rows are separated by a hairline", group.children.length === 3);
 check("the footer wraps at a width", Number(footer.native.preferredMaxLayoutWidth()) > 0);
 check("a note does too", Number(formNote("x", 300).native.preferredMaxLayoutWidth()) === 300);
+
+const control = new Label({ text: "On" });
+const leadingView = new Label({ text: "Rich Helix" });
+const settings = formSection({
+  controls: "trailing",
+  labelWidth: 180,
+  rows: [
+    { label: "Reload on Save", controls: [control], note: "Rebuild the show when a file is saved." },
+    { leading: leadingView, controls: [new Label({ text: "XR18" })] },
+  ],
+});
+const settingsGroup = settings.children[0] as VStack;
+const firstRow = settingsGroup.children[0] as VStack;
+const [nameColumn, gap, onLabel] = firstRow.children as [VStack, any, Label];
+check("a trailing row puts its label first", (nameColumn.children[0] as Label).text === "Reload on Save");
+check("its note goes under the label", (nameColumn.children[1] as Label).text === "Rebuild the show when a file is saved.");
+check("and wraps at the label column", Number((nameColumn.children[1] as Label).native.preferredMaxLayoutWidth()) === 180);
+check("then the slack, then the controls at the trailing edge", gap.constructor.name === "Spacer" && onLabel === control);
+const secondRow = settingsGroup.children[2] as VStack;
+check("a leading view takes the label's place", secondRow.children[0] === leadingView);
+const leadingColumns = formSection({ rows: [{ leading: leadingView, controls: [] }] });
+check("in a column layout too", ((leadingColumns.children[0] as VStack).children[0] as VStack).children[0] === leadingView);
 check("fixed-width digits are a font", makeFont({ size: 11, digits: true }) !== null);
 
 if (failures > 0) {

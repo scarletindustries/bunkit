@@ -468,6 +468,108 @@ export class TextField extends View {
 }
 
 // ---------------------------------------------------------------------------
+// SearchField
+// ---------------------------------------------------------------------------
+
+export interface SearchFieldOptions extends ViewOptions {
+  value?: string;
+  /** The grey text shown while it is empty. Default `"Search"`, as macOS writes it. */
+  placeholder?: string;
+  /**
+   * Fires with every change to the text: each keystroke, and the clear button. For a filter
+   * that narrows a list as you type — the way a settings window's sidebar search does.
+   */
+  onChange?: (value: string, field: SearchField) => void;
+  /** Fires when Return is pressed in it: take the first match. */
+  onSubmit?: (value: string, field: SearchField) => void;
+}
+
+/**
+ * An `NSSearchField`: the rounded field with a magnifying glass and, once something is typed, a
+ * clear button.
+ *
+ * `onChange` hears every change, the clear button included — which reaches AppKit as the field's
+ * action, not as a text change, so a filter built only on keystrokes stays filtered after the
+ * person clears it. Setting {@link value} from code is not a change and fires nothing.
+ */
+export class SearchField extends View {
+  #onChange: ((v: string, f: SearchField) => void) | null;
+  #onSubmit: ((v: string, f: SearchField) => void) | null;
+  /** The text as last reported, so the action and the delegate never report one change twice. */
+  #reported: string;
+
+  constructor(options: SearchFieldOptions = {}) {
+    const f = objc.NSSearchField.alloc().init();
+    super(f, options);
+    f.setPlaceholderString_(options.placeholder ?? "Search");
+    if (options.value !== undefined) f.setStringValue_(options.value);
+    // Every keystroke is reported by the delegate below; the action is then only the clear
+    // button and Return, and must not also fire after a pause in typing.
+    f.setSendsSearchStringImmediately_(true);
+    f.setSendsWholeSearchString_(false);
+    this.#reported = options.value ?? "";
+    this.#onChange = options.onChange ?? null;
+    this.#onSubmit = options.onSubmit ?? null;
+    const d = createDelegate(
+      {
+        controlTextDidChange_: () => this.#report(),
+        // Return: the field's own `insertNewline:`, answered here so it means "take this".
+        control_textView_doCommandBySelector_: (_control: any, _view: any, selector: string | null) => {
+          if (selector !== "insertNewline:") return false;
+          this.#report();
+          this.#onSubmit?.(this.value, this);
+          return true;
+        },
+      },
+      { protocols: ["NSSearchFieldDelegate"], name: "SearchField" },
+    );
+    this.retainJS(d);
+    f.setDelegate_(d);
+    // The clear button, which changes the text without a text-change notification.
+    const target = actionTarget(() => this.#report());
+    this.retainJS(target);
+    f.setTarget_(target);
+    f.setAction_(ACTION_SELECTOR);
+  }
+
+  /** Tell `onChange` about the text, if it differs from what it was last told. */
+  #report(): void {
+    const value = this.value;
+    if (value === this.#reported) return;
+    this.#reported = value;
+    this.#onChange?.(value, this);
+  }
+
+  /** Replace the change handler. */
+  onChange(fn: (v: string, f: SearchField) => void): this {
+    this.#onChange = fn;
+    return this;
+  }
+
+  /** Replace the Return handler. */
+  onSubmit(fn: (v: string, f: SearchField) => void): this {
+    this.#onSubmit = fn;
+    return this;
+  }
+
+  get value(): string {
+    return str(this.native.stringValue());
+  }
+
+  /** Set the text. Fires nothing: a change made from code is the caller's to act on. */
+  set value(v: string) {
+    this.#reported = v ?? "";
+    this.native.setStringValue_(v ?? "");
+  }
+
+  /** Take the keyboard — what ⌘F and a window opening on a search do. */
+  focus(): void {
+    const w = this.native.window();
+    if (w) w.makeFirstResponder_(this.native);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // TextView (multi-line)
 // ---------------------------------------------------------------------------
 
