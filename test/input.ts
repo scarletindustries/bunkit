@@ -7,12 +7,14 @@ import { initApp, pumpOnce } from "../src/runtime.ts";
 import {
   Button,
   Checkbox,
+  Container,
   HStack,
   Label,
   Table,
   TextField,
   VStack,
   Window,
+  input,
 } from "../src/ui/index.ts";
 import { constants as C } from "../src/ui/appkit.ts";
 
@@ -34,6 +36,7 @@ initApp();
 const EventType = {
   LeftMouseDown: Number(C.NSEventTypeLeftMouseDown),
   LeftMouseUp: Number(C.NSEventTypeLeftMouseUp),
+  MouseMoved: Number(C.NSEventTypeMouseMoved),
   KeyDown: Number(C.NSEventTypeKeyDown),
   KeyUp: Number(C.NSEventTypeKeyUp),
 };
@@ -174,10 +177,12 @@ function postKey(win: any, chars: string, keyCode: number, type: number) {
     { name: "second", n: 2 },
     { name: "third", n: 3 },
   ];
+  const clicked: [number, any][] = [];
   const table = new Table({
     columns: [{ id: "name", title: "Name" }, { id: "n", title: "N", width: 50 }],
     rows,
     onSelect: (row, i) => picked.push([i, row]),
+    onClick: (row, i) => clicked.push([i, row]),
     grow: 1,
   });
   const win = new Window({
@@ -206,6 +211,14 @@ function postKey(win: any, chars: string, keyCode: number, type: number) {
   check("clicking a row selected it", table.selectedIndex === 1, table.selectedIndex);
   check("onSelect got the right row object", picked.some(([i, r]) => i === 1 && r?.name === "second"),
     JSON.stringify(picked));
+  // A second click on the row already selected: no selection change, so no onSelect — but a
+  // row that does something must hear it again.
+  const selects = picked.length;
+  app.postEvent_atStart_(mk(EventType.LeftMouseDown), false);
+  app.postEvent_atStart_(mk(EventType.LeftMouseUp), false);
+  settle(16);
+  check("onClick hears every click, the second on the same row too", clicked.length === 2 && clicked.every(([i, r]) => i === 1 && r?.name === "second"), clicked.length);
+  check("while onSelect hears only the change", picked.length === selects, picked.length);
   win.close();
 }
 
@@ -231,6 +244,104 @@ function postKey(win: any, chars: string, keyCode: number, type: number) {
   settle(10);
   check("cmd+D was routed by the menu", handled === true, handled);
   check("the menu item's JS handler ran", fired === 1, fired);
+  win.close();
+}
+
+// ---------------------------------------------------------------------------
+// A scene under a control: whose press is it?
+// ---------------------------------------------------------------------------
+{
+  // The scene fills its container; a button sits on top of it, as a toolbar or a sidebar
+  // sits over content that runs under the glass.
+  const scene = new Container({ background: "#203040" });
+  const area = new Container();
+  area.fill(scene);
+  let clicks = 0;
+  const button = new Button({ title: "Front", onClick: () => clicks++ });
+  // The button is not the scene's: it is in the window's root, on top of the scene's area.
+  const root = new Container();
+  root.fill(area);
+  root.add(button);
+  button.native.setFrameOrigin_({ x: 20, y: 20 });
+  const win = new Window({ title: "over", size: { width: 420, height: 260 }, content: root, show: true });
+  settle(20);
+  const keys = input().track(scene, area);
+
+  // The button tracks the mouse itself until the release, and the release never reaches the
+  // monitor — so the press used to stay down for good.
+  click(win.native, button.native);
+  check("the button was clicked", clicks === 1, clicks);
+  check("a press that began on a control over the scene is not the scene's", !keys.mouse.pressedOver);
+  postMouse(win.native, scene.native, EventType.MouseMoved, { x: 300, y: 200 });
+  settle(6);
+  check("the next move lets go of a release a control swallowed", !keys.button(0));
+  check("and the pointer is over the scene now", keys.mouse.over && keys.mouse.inside);
+
+  postMouse(win.native, scene.native, EventType.LeftMouseDown, { x: 300, y: 200 });
+  settle(6);
+  check("a press on the scene is the scene's", keys.button(0) && keys.mouse.pressedOver);
+  postMouse(win.native, scene.native, EventType.LeftMouseUp, { x: 300, y: 200 });
+  settle(6);
+  check("and lets go", !keys.button(0) && !keys.mouse.pressedOver);
+
+  // Geometry says the button is inside the scene's rectangle; hit-testing says it is in front.
+  postMouse(win.native, button.native, EventType.MouseMoved);
+  settle(6);
+  check("over a control the pointer is inside the scene but not over it", keys.mouse.inside && !keys.mouse.over);
+  win.close();
+}
+
+// ---------------------------------------------------------------------------
+// Any view can take a click
+// ---------------------------------------------------------------------------
+{
+  let clicked = 0;
+  const card = new Container({ background: "#304050" });
+  card.onClick(() => clicked++);
+  const win = new Window({ title: "click a view", size: { width: 300, height: 200 }, content: card, show: true });
+  settle(20);
+  click(win.native, card.native);
+  check("a click on a plain view with onClick reached it", clicked === 1, clicked);
+  win.close();
+}
+
+// ---------------------------------------------------------------------------
+// Presses counted, and nothing left held by another application
+// ---------------------------------------------------------------------------
+{
+  const scene = new Container({ background: "#203040" });
+  const win = new Window({ title: "presses", size: { width: 300, height: 200 }, content: scene, show: true });
+  settle(20);
+  const keys = input().track(scene);
+
+  // A tap: press and release between two polls. `button()` never reads it; the count does.
+  const before = keys.presses(0);
+  postMouse(win.native, scene.native, EventType.LeftMouseDown);
+  postMouse(win.native, scene.native, EventType.LeftMouseUp);
+  settle(6);
+  check("a tap is counted though the button was never seen held", keys.presses(0) === before + 1 && !keys.button(0));
+  check("and it says whether it began over the view", keys.mouse.lastPressOver);
+
+  // ⌘ went down, and its release happened while another application had the keyboard.
+  postKey(win.native, "x", 7, EventType.KeyDown);
+  const cmd = objc.NSEvent.keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode_(
+    EventType.KeyDown, { x: 0, y: 0 }, Number(C.NSEventModifierFlagCommand), objc.NSProcessInfo.processInfo().systemUptime(),
+    win.native.windowNumber(), null, "y", "y", false, 16,
+  );
+  objc.NSApplication.sharedApplication().postEvent_atStart_(cmd, false);
+  settle(6);
+  check("a key pressed with ⌘ holds ⌘", keys.command);
+  postKey(win.native, "z", 6, EventType.KeyDown);
+  settle(6);
+  check("the next key without ⌘ lets ⌘ go — the event's own flags say what is held", !keys.command);
+
+  // W held at the moment the application went inactive.
+  postKey(win.native, "w", 13, EventType.KeyDown);
+  settle(6);
+  check("w is held", keys.held("w"));
+  objc.NSNotificationCenter.defaultCenter().postNotificationName_object_("NSApplicationDidResignActiveNotification", objc.NSApplication.sharedApplication());
+  settle(6);
+  check("going inactive lets every key go", !keys.held("w") && !keys.held("x") && keys.keys.size === 0);
   win.close();
 }
 

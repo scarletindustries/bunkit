@@ -183,6 +183,54 @@ export function perspective(
   return out;
 }
 
+/** How much of each edge of a view is covered — by a toolbar, a sidebar — in any one unit. */
+export interface Insets4 {
+  top: number;
+  left: number;
+  bottom: number;
+  right: number;
+}
+
+/**
+ * A perspective projection fitted to the part of a view that is **not covered** — the
+ * rectangle left inside `insets` — while still filling the whole view.
+ *
+ * Content that runs under glass (a sidebar, an inspector, a toolbar) would otherwise frame
+ * itself on the middle of the whole view, part of which nobody can see. This is the
+ * projection a camera would have if the visible rectangle were the entire viewport, with the
+ * picture carried on out under the covered edges: `fovYRadians` spans the visible height,
+ * and the visible centre is where the camera looks. With no insets it is exactly
+ * {@link perspective}.
+ *
+ * Only ratios matter, so `width`, `height` and `insets` may be points or pixels as long as
+ * they agree. Metal's 0–1 depth, right-handed, as {@link perspective}.
+ */
+export function insetPerspective(
+  fovYRadians: number,
+  width: number,
+  height: number,
+  insets: Insets4,
+  near: number,
+  far: number,
+  out: Mat4 = new Float32Array(16),
+): Mat4 {
+  const W = Math.max(1, width);
+  const H = Math.max(1, height);
+  const visibleH = Math.max(1, H - insets.top - insets.bottom);
+  const f = 1 / Math.tan(fovYRadians / 2);
+  out.fill(0);
+  // The visible rectangle's own projection (aspect = its width over its height), scaled by
+  // its share of the view and moved to its centre in clip space.
+  out[0] = (f * visibleH) / W;
+  out[5] = (f * visibleH) / H;
+  out[8] = -(insets.left - insets.right) / W;
+  out[9] = -(insets.bottom - insets.top) / H;
+  out[10] = far / (near - far);
+  out[11] = -1;
+  out[14] = (far * near) / (near - far);
+  return out;
+}
+
 /** A right-handed view matrix: the camera sits at `eye` looking at `target`. */
 export function lookAt(eye: Vec3, target: Vec3, up: Vec3, out: Mat4 = new Float32Array(16)): Mat4 {
   const z = v3normalize(v3sub(eye, target)); // backwards

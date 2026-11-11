@@ -136,6 +136,17 @@ switches.select(1, true);
 check("select sets one segment", switches.selected[1] === true);
 toolbar.item("transport").setSegment(1, { symbol: "pause.fill", label: "Pause" });
 check("a segment can change its label", toolbar.item("transport").spec.kind === "group" && (toolbar.item("transport").spec as any).segments[1].label === "Pause");
+// AppKit's validation pass re-enabled a disabled segment a few times a second, and the app's
+// next sync disabled it again: a transport that flickered while nothing was loaded.
+const transportSegment = toolbar.item("transport").native.subitems().objectAtIndex_(1);
+toolbar.item("transport").enableSegment(1, false);
+let reEnabled = false;
+for (let i = 0; i < 40; i++) {
+  pumpOnce(0.01);
+  if (Boolean(transportSegment.isEnabled())) reEnabled = true;
+}
+check("a disabled segment stays disabled — AppKit does not validate it back on", !reEnabled);
+toolbar.item("transport").enableSegment(1, true);
 let threw = false;
 try {
   toolbar.item("nope");
@@ -165,7 +176,10 @@ const other = new Container({ background: "#203020" });
 split.setContent(other);
 pump();
 check("content swaps", split.content === other && other.native.superview()?.ptr === split.contentHost.native.ptr);
+// Hidden, not removed: putting a large view back into a window is most of what a switch costs.
+check("the content it replaced stays in the pane, hidden", content.native.superview()?.ptr === split.contentHost.native.ptr && Boolean(content.native.isHidden()));
 split.setContent(content);
+check("and switching back shows it again, hiding the other", !Boolean(content.native.isHidden()) && Boolean(other.native.isHidden()));
 split.inspectorCollapsed = true;
 pump(60);
 check("the inspector collapses", split.inspectorCollapsed);
@@ -202,6 +216,17 @@ cy.setActive_(true);
 pump();
 const cardFrame = frame(card);
 check("the glass wraps its content with its padding", Number(cardFrame.width) > 60 && Number(cardFrame.height) > 50, cardFrame);
+// A passive card says something over a scene; a click on it is a click on what is under it.
+const passive = new GlassView(new Label({ text: "Standby" }), { passive: true, padding: 18 });
+content.add(passive);
+pump();
+const middle = passive.native.convertPoint_toView_({ x: Number(passive.native.bounds().width) / 2, y: Number(passive.native.bounds().height) / 2 }, null);
+const under = win.native.contentView().hitTest_(middle);
+check("a passive glass is never what a click lands on", under !== null && under.ptr !== passive.native.ptr && !Boolean(under.isDescendantOf_(passive.native)));
+const solid = card.native.convertPoint_toView_({ x: 4, y: 4 }, null);
+const onCard = win.native.contentView().hitTest_(solid);
+check("an ordinary one is", onCard !== null && Boolean(onCard.isDescendantOf_(card.native)));
+passive.removeFromParent();
 
 console.log("popover");
 const popover = new Popover({ content: new VStack({ padding: 16 }, [new Label({ text: "Brightness" })]) });

@@ -38,8 +38,24 @@ export interface TableOptions<Row = any> extends ViewOptions {
   columns: Column<Row>[];
   rows?: Row[];
   onSelect?: (row: Row | null, index: number) => void;
+  /**
+   * A click on a row — every click, including one on the row already selected, and never an
+   * arrow key. For a row that **does** something (seek there, apply this): `onSelect` fires
+   * on every arrow-key step and not at all when the selection does not change, so an action on
+   * it repeats as you walk the list and refuses a second click.
+   */
+  onClick?: (row: Row, index: number) => void;
   onDoubleClick?: (row: Row, index: number) => void;
   rowHeight?: number;
+  /**
+   * Whether the table takes the keyboard when clicked — arrow keys move its selection, typing
+   * jumps to a row whose text starts with what was typed. Default `true`. `false` for a list of
+   * things that **do** something when chosen, in a window whose keys mean something else: the
+   * table still takes clicks, but never focus, so a key typed after clicking it goes to whatever
+   * had the keyboard before. (A cue list that took focus fired a section for a letter typed as a
+   * shortcut, and walked the show through every section an arrow key passed.)
+   */
+  keyboard?: boolean;
   headers?: boolean;
   /** "plain" | "inset" | "sourceList" | "fullWidth" */
   style?: keyof typeof TableViewStyle;
@@ -65,10 +81,13 @@ export class Table<Row = any> extends View {
   #dataSource: any;
   #onSelect?: (row: Row | null, index: number) => void;
   #onDoubleClick?: (row: Row, index: number) => void;
+  #onClick?: (row: Row, index: number) => void;
   #font: any;
   readonly #options: TableOptions<Row>;
   // Views handed to AppKit must stay reachable from JS until AppKit lets go.
   #cellViews = new Set<any>();
+  // A rendered column's views, by row: a row reloaded on its own gives its old ones up here.
+  readonly #rendered = new Map<number, any[]>();
   // The text each row's cells were last given, by row and then by column (in
   // `#columns` order). Written whenever a text cell is filled, so a new set of
   // rows can be compared against what is actually on screen.
@@ -103,11 +122,16 @@ export class Table<Row = any> extends View {
     }
     this.scrollView = scroll;
     this.tableView = tv;
+    if (options.keyboard === false) {
+      tv.setRefusesFirstResponder_(true);
+      tv.setAllowsTypeSelect_(false);
+    }
     this.#options = options;
     this.#columns = options.columns;
     this.#rows = options.rows ?? [];
     this.#onSelect = options.onSelect;
     this.#onDoubleClick = options.onDoubleClick;
+    this.#onClick = options.onClick;
     this.#font = options.font !== undefined ? makeFont(options.font) : null;
 
     // Slack goes to the columns marked `flex`, else to those with no explicit
@@ -159,7 +183,9 @@ export class Table<Row = any> extends View {
 
           if (spec.render) {
             const v = spec.render(data, index);
-            self.#cellViews.add(v);
+            let views = self.#rendered.get(index);
+            if (!views) self.#rendered.set(index, (views = []));
+            views.push(v);
             return v.native;
           }
 
@@ -249,14 +275,25 @@ export class Table<Row = any> extends View {
     this.tableView.setDataSource_(this.#dataSource);
     this.tableView.setDelegate_(this.#dataSource);
 
-    if (this.#onDoubleClick) {
+    if (this.#onDoubleClick || this.#onClick) {
+      // One target for both: AppKit sends the click and the double-click to the same target, so
+      // the event's click count says which this is.
       const t = actionTarget(() => {
-        const i = this.selectedIndex;
-        if (i >= 0 && this.#rows[i] !== undefined) this.#onDoubleClick!(this.#rows[i]!, i);
+        const event = objc.NSApplication.sharedApplication().currentEvent();
+        const count = event && event.ptr !== 0n ? Number(event.clickCount()) : 1;
+        const clicked = Number(this.tableView.clickedRow());
+        if (count >= 2) {
+          const i = clicked >= 0 ? clicked : this.selectedIndex;
+          if (this.#onDoubleClick && i >= 0 && this.#rows[i] !== undefined) this.#onDoubleClick(this.#rows[i]!, i);
+          return;
+        }
+        // -1 is the header or the empty space below the last row.
+        if (this.#onClick && clicked >= 0 && this.#rows[clicked] !== undefined) this.#onClick(this.#rows[clicked]!, clicked);
       });
       this.retainJS(t);
       this.tableView.setTarget_(t);
-      this.tableView.setDoubleAction_(ACTION_SELECTOR);
+      if (this.#onClick) this.tableView.setAction_(ACTION_SELECTOR);
+      if (this.#onDoubleClick) this.tableView.setDoubleAction_(ACTION_SELECTOR);
     }
   }
 
@@ -284,8 +321,7 @@ export class Table<Row = any> extends View {
   set rows(v: Row[]) {
     const next = v ?? [];
     if (this.#columns.some((c) => c.render)) {
-      this.#rows = next;
-      this.reload();
+      this.#setRenderedRows(next);
       return;
     }
     // What AppKit believes the count is, not the old array's length: a caller
@@ -306,8 +342,40 @@ export class Table<Row = any> extends View {
   /** Throw every cell away and rebuild what is visible. */
   reload(): void {
     this.#cellViews.clear();
+    this.#rendered.clear();
     this.#shown.clear();
     this.tableView.reloadData();
+  }
+
+  /**
+   * New rows for a table with a rendered column: rebuild **only the rows that changed**.
+   *
+   * A rendered cell is a view of the caller's, so there is no text to compare and patch in
+   * place — but there are the rows. The same number of rows, compared field by field
+   * ({@link sameRow}): the changed ones are reloaded, and their heights re-asked when the table
+   * has {@link TableOptions.heightOf}. Picking a song in a 31-row set used to rebuild every
+   * row's views — 25–37 ms on the thread the lighting renders on, for a change to two rows. A
+   * different count is still a full reload.
+   */
+  #setRenderedRows(next: Row[]): void {
+    const before = this.#rows;
+    this.#rows = next;
+    if (before.length !== next.length || Number(this.tableView.numberOfRows()) !== next.length) {
+      this.reload();
+      return;
+    }
+    const changed: number[] = [];
+    for (let i = 0; i < next.length; i++) if (!sameRow(before[i], next[i])) changed.push(i);
+    if (changed.length === 0) return;
+    const rows = objc.NSMutableIndexSet.indexSet();
+    for (const i of changed) {
+      rows.addIndex_(i);
+      this.#rendered.delete(i);
+      this.#shown.delete(i);
+    }
+    const columns = objc.NSIndexSet.indexSetWithIndexesInRange_({ location: 0, length: this.#columns.length });
+    this.tableView.reloadDataForRowIndexes_columnIndexes_(rows, columns);
+    if (this.#options.heightOf) this.tableView.noteHeightOfRowsWithIndexesChanged_(rows);
   }
 
   /** A cell's text, as the datasource and an in-place refresh both produce it. */
@@ -437,6 +505,26 @@ export class Table<Row = any> extends View {
 }
 
 /** An `NSIndexSet` of `length` indexes from `location`. */
+/**
+ * Whether two rows would draw the same: the same object, or plain objects whose own fields are
+ * equal — `===`, or for a field that is itself a plain object, the same comparison one level
+ * down (a row that wraps the record it shows). Anything deeper, or an array, compares by
+ * identity, so a row built fresh with new nested data counts as changed — the safe side. Pure.
+ */
+function sameRow(a: unknown, b: unknown, depth = 0): boolean {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  if (depth > 1 || Array.isArray(a) || Array.isArray(b)) return false;
+  if (Object.getPrototypeOf(a) !== Object.prototype || Object.getPrototypeOf(b) !== Object.prototype) return false;
+  const ka = Object.keys(a);
+  const kb = Object.keys(b);
+  if (ka.length !== kb.length) return false;
+  for (const key of ka) {
+    if (!sameRow((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key], depth + 1)) return false;
+  }
+  return true;
+}
+
 function rangeSet(location: number, length: number): any {
   return objc.NSIndexSet.indexSetWithIndexesInRange_({ location, length });
 }

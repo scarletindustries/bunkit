@@ -474,6 +474,14 @@ export class Toolbar {
     }
     if (spec.tooltip) native.setToolTip_(spec.tooltip);
     if (spec.visibility) native.setVisibilityPriority_(VISIBILITY[spec.visibility]);
+    // Enabled is ours to say ({@link ToolbarItem.enabled}, `enableSegment`). Left on, AppKit's
+    // validation pass re-enables a disabled segment a few times a second and the next sync
+    // disables it again — a button that flickers between lit and grey.
+    native.setAutovalidates_(false);
+    if (spec.kind === "group") {
+      const subitems = native.subitems();
+      for (let i = 0; i < Number(subitems.count()); i++) subitems.objectAtIndex_(i).setAutovalidates_(false);
+    }
     handle = new ToolbarItem(native, spec);
     return handle;
   }
@@ -529,6 +537,8 @@ export class SplitLayout {
   readonly contentHost: Container;
   readonly inspectorHost: Container | undefined;
   #content: View;
+  /** Every view that has been the content, still in the pane — hidden unless it is the content. */
+  readonly #placed = new Set<View>();
   #accessory: { view: View; controller: any } | undefined;
   readonly #keep: any[] = [];
 
@@ -552,6 +562,7 @@ export class SplitLayout {
     const content = pane(options.content, false);
     this.contentHost = content.host;
     this.#content = options.content;
+    this.#placed.add(options.content);
     this.contentItem = objc.NSSplitViewItem.splitViewItemWithViewController_(content.vc);
     this.contentItem.setAutomaticallyAdjustsSafeAreaInsets_(options.contentUnderPanes ?? true);
     this.controller.addSplitViewItem_(this.contentItem);
@@ -571,8 +582,13 @@ export class SplitLayout {
   }
 
   /**
-   * Show something else in the content pane — a different mode. The old view is kept alive by
-   * the caller.
+   * Show something else in the content pane — a different mode.
+   *
+   * The view it replaces is **hidden, not removed**: it stays in the pane, and switching back
+   * shows it again. Taking a large view out of a window and putting it back — a Metal view, a
+   * table of hundreds of rows — is most of what a switch costs (measured: two thirds of an
+   * editor's 50 ms mode switch); hiding is a flag. A view's placement is decided the first
+   * time it is shown, so `safeArea` is read only then.
    *
    * @param safeArea keep the view to the pane's safe area — below the toolbar and the strip —
    *   rather than running under them. For content that draws something of its own at its very
@@ -580,8 +596,12 @@ export class SplitLayout {
    */
   setContent(view: View, options: { safeArea?: boolean } = {}): void {
     if (view === this.#content) return;
-    this.#content.removeFromParent();
-    place(this.contentHost, view, options.safeArea ?? false);
+    this.#content.hidden = true;
+    if (!this.#placed.has(view)) {
+      place(this.contentHost, view, options.safeArea ?? false);
+      this.#placed.add(view);
+    }
+    view.hidden = false;
     this.#content = view;
   }
 
@@ -687,6 +707,12 @@ export interface GlassOptions extends ViewOptions {
   style?: "regular" | "clear";
   /** Space between the glass's edge and its content, in points. Default 12. */
   padding?: number | { top?: number; left?: number; bottom?: number; right?: number };
+  /**
+   * Status that clicks pass straight through, to whatever is under the glass. For a card that
+   * only says something — over a 3D scene, a press on it is a press on the scene. It holds no
+   * controls: nothing inside a passive glass can be clicked either.
+   */
+  passive?: boolean;
 }
 
 /**
@@ -700,7 +726,13 @@ export class GlassView extends View {
   #content: View | undefined;
 
   constructor(content: View | undefined, options: GlassOptions = {}) {
-    const glass = objc.NSGlassEffectView.alloc().init();
+    const glass = options.passive
+      ? createDelegate(
+        // Nothing here is ever the view a click lands on, so AppKit carries on to what is under it.
+        { hitTest_: () => null },
+        { superclass: "NSGlassEffectView", name: "PassiveGlass", types: { hitTest_: "@@:{CGPoint=dd}" } },
+      )
+      : objc.NSGlassEffectView.alloc().init();
     super(glass, options);
     if (options.radius !== undefined) glass.setCornerRadius_(options.radius);
     if (options.tint !== undefined) glass.setTintColor_(toNSColor(options.tint));

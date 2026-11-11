@@ -95,6 +95,20 @@ export class View {
     if (o.background !== undefined) this.setBackground(o.background);
   }
 
+  /**
+   * Call `fn` when the view is clicked — any view, through an AppKit click gesture recogniser,
+   * for a row or a card that does something without being a button. Side effect: adds the
+   * recogniser to the view. Call it once; a second call adds a second recogniser.
+   */
+  onClick(fn: () => void): this {
+    const target = actionTarget(() => fn());
+    const recognizer = objc.NSClickGestureRecognizer.alloc().initWithTarget_action_(target, ACTION_SELECTOR);
+    this.native.addGestureRecognizer_(recognizer);
+    this.retainJS(target);
+    this.retainJS(recognizer);
+    return this;
+  }
+
   /** Keep a JS object reachable for as long as this view is. */
   retainJS(v: any) {
     this._keepAlive.push(v);

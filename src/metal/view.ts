@@ -183,12 +183,21 @@ export class GPUView extends View {
   }
 
   /**
+   * What a click must land in to count as one on this view — `mouse.over` and
+   * `mouse.pressedOver` in {@link input}. Default: the view itself. Set it to the container
+   * the view shares with overlays of its own (labels over the scene, a transparent view that
+   * takes keyboard focus), so a click on those still reaches the scene.
+   */
+  inputArea: View | undefined;
+
+  /**
    * Keyboard and mouse, with the pointer reported in this view's coordinates.
    *
    *   if (view.input.held("w")) camera.position.z -= speed * frame.dt;
+   *   if (view.input.mouse.pressedOver) orbit(view.input.mouse.dx);
    */
   get input(): Input {
-    return input().track(this);
+    return input().track(this, this.inputArea ?? this);
   }
 
   start(): this {

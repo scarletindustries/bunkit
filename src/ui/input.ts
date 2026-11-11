@@ -104,8 +104,31 @@ export interface MouseState {
   wheelY: number;
   /** Held buttons: 0 left, 1 right, 2 and up for the rest. */
   buttons: Set<number>;
-  /** Whether the pointer is over the tracked view. */
+  /**
+   * Whether the pointer is within the tracked view's rectangle, in the view's own window.
+   * Geometry only: a sidebar, a toolbar or a button drawn **over** the view still counts as
+   * inside. For "is this gesture for the view", read {@link over} and {@link pressedOver}.
+   */
   inside: boolean;
+  /**
+   * Whether, at the last mouse or scroll event, the pointer was over the tracked **area** with
+   * nothing in front of it — what AppKit's hit-testing would deliver the click to. False over
+   * a control, a pane or a toolbar laid on top of the view, and for an event in another
+   * window. What a scroll that should zoom a scene asks.
+   */
+  over: boolean;
+  /**
+   * Whether the press now held began {@link over} the tracked area. Decided at the press, so a
+   * drag that begins on a slider and wanders over the scene is still the slider's. What a
+   * drag that should orbit a camera asks. False while no button is held.
+   */
+  pressedOver: boolean;
+  /**
+   * Whether the most recent press began over the tracked area — kept after the release, so a
+   * click whose press and release both happened between two polls can still be told apart
+   * from one on a control. Read it with {@link Input.presses}.
+   */
+  lastPressOver: boolean;
 }
 
 export type KeyHandler = (key: string, event: any) => void;
@@ -128,8 +151,17 @@ export class Input {
   #wheelTick = -1;
   #buttons = new Set<number>();
   #inside = false;
+  #over = false;
+  #pressedOver = false;
+  /** Presses of each button so far — see {@link presses}. */
+  readonly #presses = new Map<number, number>();
+  /** The NSNotificationCenter observer that releases everything when the app goes inactive. */
+  #resignObserver: any = null;
+  #resignBlock: ReturnType<typeof createBlock> | null = null;
 
   #view: View | null = null;
+  /** The view whose hits count as {@link MouseState.over}: the tracked view, or what holds it. */
+  #area: View | null = null;
   #monitor: any = null;
   #block: ReturnType<typeof createBlock> | null = null;
   #keyDown: KeyHandler[] = [];
@@ -137,14 +169,20 @@ export class Input {
   #scroll: ScrollHandler[] = [];
 
   /**
-   * Report mouse position relative to this view, and set `inside`.
+   * Report mouse position relative to this view, and set `inside`, `over` and `pressedOver`.
+   *
+   * @param area the view a hit must land in to count as {@link MouseState.over} — default
+   *   `view`. Give the container when the view shares it with overlays of its own (labels
+   *   drawn over a scene, a transparent view that takes keyboard focus): a click on those is
+   *   still a click on the scene, while a control in some other container is not.
    *
    * Also turns on mouse-moved events for its window: AppKit does not deliver
    * them by default, and a game that never gets them looks like one where the
    * mouse is broken.
    */
-  track(view: View): this {
+  track(view: View, area: View = view): this {
     this.#view = view;
+    this.#area = area;
     const window = view.native.window();
     if (window && window.ptr !== NIL) window.setAcceptsMouseMovedEvents_(true);
     return this;
@@ -188,10 +226,34 @@ export class Input {
       wheelY: this.#wheelTick === current ? this.#wheelY : 0,
       buttons: this.#buttons,
       inside: this.#inside,
+      over: this.#over,
+      pressedOver: this.#pressedOver && this.#buttons.size > 0,
+      lastPressOver: this.#pressedOver,
     };
   }
 
-  /** Is this mouse button down? 0 is left, 1 is right. */
+  /**
+   * How many times this button has been pressed since the application started. 0 is left.
+   *
+   * For a loop that polls once a frame: a quick tap — a trackpad's tap to click — can press
+   * and release between two polls, and `button()` then never reads true; the click was lost.
+   * Remember the count you last saw; a higher one is a press you have not handled yet, and
+   * {@link MouseState.lastPressOver} says whether it began over your view. Several readers
+   * can each keep their own count — nothing is consumed.
+   */
+  presses(index = 0): number {
+    return this.#presses.get(index) ?? 0;
+  }
+
+  /**
+   * Is this mouse button down? 0 is left, 1 is right.
+   *
+   * A control that tracks the mouse itself — a button, a slider, a segmented control — runs
+   * its own loop until the release and the release never reaches this monitor. So a button
+   * also counts as released on the next mouse **move**, which AppKit only sends while no
+   * button is held; otherwise the press that clicked a control stayed down here forever, and
+   * every later movement of the pointer read as a drag.
+   */
   button(index = 0): boolean {
     return this.#buttons.has(index);
   }
@@ -216,12 +278,27 @@ export class Input {
     this.#monitor = objc.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
       ALL_EVENTS, this.#block,
     );
+    // Going inactive is not an event this monitor sees, so watch for it: see `releaseAll`.
+    this.#resignBlock = createBlock("v@?@", () => {
+      try {
+        this.releaseAll();
+      } catch (e) {
+        console.error("[input] releasing on deactivate failed:", e);
+      }
+    });
+    this.#resignObserver = objc.NSNotificationCenter.defaultCenter().addObserverForName_object_queue_usingBlock_(
+      "NSApplicationDidResignActiveNotification", null, null, this.#resignBlock,
+    );
     return this;
   }
 
   stop(): this {
     if (this.#monitor) objc.NSEvent.removeMonitor_(this.#monitor);
     this.#monitor = null;
+    if (this.#resignObserver) objc.NSNotificationCenter.defaultCenter().removeObserver_(this.#resignObserver);
+    this.#resignObserver = null;
+    this.#resignBlock?.dispose();
+    this.#resignBlock = null;
     this.#block?.dispose();
     this.#block = null;
     return this;
@@ -235,6 +312,10 @@ export class Input {
         // Auto-repeat is the OS being helpful about text entry; for held-key
         // polling it would re-fire pressed() every few milliseconds.
         if (event.isARepeat()) return;
+        // The modifiers held *now*, by the event's own flags: a release that happened while
+        // another application had the keyboard never reached this monitor, and a ⌘ that stayed
+        // "held" turned every later key into a chord.
+        this.#syncModifiers(Number(event.modifierFlags()));
         const key = KEY_NAMES[Number(event.keyCode())] ?? "";
         if (!key) return;
         this.#held.add(key);
@@ -252,22 +333,7 @@ export class Input {
       }
       case EventType.flagsChanged: {
         // Modifiers have no key-up event; the flags word says what is held now.
-        const flags = Number(event.modifierFlags());
-        this.#modifiers = flags;
-        for (const [bit, name] of MODIFIERS) {
-          const down = (flags & bit) !== 0;
-          const was = this.#held.has(name);
-          if (down === was) continue;
-          if (down) {
-            this.#held.add(name);
-            this.#downAt.set(name, frameTick());
-            for (const fn of this.#keyDown) fn(name, event);
-          } else {
-            this.#held.delete(name);
-            this.#upAt.set(name, frameTick());
-            for (const fn of this.#keyUp) fn(name, event);
-          }
-        }
+        this.#syncModifiers(Number(event.modifierFlags()), event);
         return;
       }
       case EventType.scrollWheel: {
@@ -281,18 +347,100 @@ export class Input {
         const dy = Number(event.scrollingDeltaY());
         this.#wheelX += dx;
         this.#wheelY += dy;
+        this.#over = this.#hit(event);
         for (const fn of this.#scroll) fn(dx, dy, event);
         return;
       }
-      case EventType.leftMouseDown: this.#buttons.add(0); break;
+      case EventType.leftMouseDown:
+      case EventType.rightMouseDown:
+      case EventType.otherMouseDown: {
+        const button = type === EventType.leftMouseDown ? 0 : type === EventType.rightMouseDown ? 1 : Number(event.buttonNumber());
+        this.#over = this.#hit(event);
+        // The first button down decides where the gesture began; a second one joining it does not.
+        if (this.#buttons.size === 0) this.#pressedOver = this.#over;
+        this.#buttons.add(button);
+        this.#presses.set(button, (this.#presses.get(button) ?? 0) + 1);
+        break;
+      }
       case EventType.leftMouseUp: this.#buttons.delete(0); break;
-      case EventType.rightMouseDown: this.#buttons.add(1); break;
       case EventType.rightMouseUp: this.#buttons.delete(1); break;
-      case EventType.otherMouseDown: this.#buttons.add(Number(event.buttonNumber())); break;
       case EventType.otherMouseUp: this.#buttons.delete(Number(event.buttonNumber())); break;
+      case EventType.mouseMoved:
+        // Only sent with no button held — so any release a control's tracking loop swallowed
+        // has happened. See `button`.
+        this.#buttons.clear();
+        this.#over = this.#hit(event);
+        break;
     }
 
     this.#updatePosition(event);
+  }
+
+  /** Make the held modifiers match a flags word — the event's, which is what is held now. */
+  #syncModifiers(flags: number, event: any = null): void {
+    this.#modifiers = flags;
+    for (const [bit, name] of MODIFIERS) {
+      const down = (flags & bit) !== 0;
+      const was = this.#held.has(name);
+      if (down === was) continue;
+      if (down) {
+        this.#held.add(name);
+        this.#downAt.set(name, frameTick());
+        for (const fn of this.#keyDown) fn(name, event);
+      } else {
+        this.#held.delete(name);
+        this.#upAt.set(name, frameTick());
+        for (const fn of this.#keyUp) fn(name, event);
+      }
+    }
+  }
+
+  /**
+   * Let go of every key and button — the application stopped being active, and whatever is
+   * released while another one has the keyboard and the mouse never reaches this monitor. A W
+   * held at the moment of a ⌘-Tab used to fly a camera on for as long as nobody pressed W again.
+   * Side effect: fires `onKeyUp` for every key it releases.
+   */
+  releaseAll(): void {
+    const tick = frameTick();
+    for (const key of [...this.#held]) {
+      this.#held.delete(key);
+      this.#upAt.set(key, tick);
+      for (const fn of this.#keyUp) fn(key, null);
+    }
+    this.#modifiers = 0;
+    this.#buttons.clear();
+  }
+
+  /**
+   * Whether this event's pointer is over the tracked area with nothing in front of it: in the
+   * same window, and AppKit's hit-test lands in the area. Asked of the window's frame view,
+   * not its content view, so the toolbar — which sits over full-size content — is in front.
+   */
+  #hit(event: any): boolean {
+    const view = this.#view;
+    const area = this.#area ?? view;
+    if (!view || !area) return false;
+    const own = view.native.window();
+    if (!own || own.ptr === NIL) return false;
+    const window = event.window();
+    let point = event.locationInWindow();
+    if (!window || window.ptr === NIL) {
+      // An event with no window — one made from a CGEvent — carries a point on the screen.
+      // It is this window's if this window is the one on top at that point.
+      const number = objc.NSWindow.windowNumberAtPoint_belowWindowWithWindowNumber_(point, 0);
+      if (Number(number) !== Number(own.windowNumber())) return false;
+      point = own.convertPointFromScreen_(point);
+    } else if (own.ptr !== window.ptr) {
+      return false;
+    }
+    const content = own.contentView();
+    if (!content || content.ptr === NIL) return false;
+    const frame = content.superview();
+    const top = frame && frame.ptr !== NIL ? frame : content;
+    const hit = top.hitTest_(point);
+    if (!hit || hit.ptr === NIL) return false;
+    return Boolean(hit.isDescendantOf_(area.native));
   }
 
   #updatePosition(event: any): void {
@@ -300,6 +448,14 @@ export class Input {
     if (!view) return;
     const window = event.window();
     if (!window || window.ptr === NIL) return;
+    // A point in another window is in that window's coordinates; converted as though it were
+    // this one's, a click in a popover or a settings window could land "inside" the view.
+    const own = view.native.window();
+    if (!own || own.ptr === NIL || own.ptr !== window.ptr) {
+      this.#inside = false;
+      this.#over = false;
+      return;
+    }
 
     const inWindow = event.locationInWindow();
     const local = view.native.convertPoint_fromView_(inWindow, null);

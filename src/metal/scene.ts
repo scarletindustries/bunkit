@@ -33,8 +33,8 @@ import {
   Vertex, type Geometry,
 } from "./geometry.ts";
 import {
-  compose, lookAt, multiply, normalMatrix, perspective, radians, toVec3, v3normalize,
-  type Mat4, type Vec3,
+  compose, insetPerspective, lookAt, multiply, normalMatrix, perspective, radians, toVec3, v3normalize,
+  type Insets4, type Mat4, type Vec3,
 } from "./math.ts";
 
 // ---------------------------------------------------------------------------
@@ -398,6 +398,13 @@ export interface CameraOptions {
 export class Camera {
   position: Vec3; target: Vec3; up: Vec3;
   fov: number; near: number; far: number;
+  /**
+   * How much of each edge of the view is covered, **in points** — a glass sidebar, toolbar
+   * or inspector the scene runs under. The projection is fitted to what is left: `fov` spans
+   * the visible height and the visible centre is where the camera looks
+   * ({@link insetPerspective}). All zero, the default, is the whole view.
+   */
+  insets: Insets4 = { top: 0, left: 0, bottom: 0, right: 0 };
 
   constructor(o: CameraOptions = {}) {
     this.position = toVec3(o.position ?? [0, 2, 6]);
@@ -664,11 +671,23 @@ export class Scene3D extends GPUView {
     }
 
     lookAt(this.camera.position, this.camera.target, this.camera.up, this.#view);
-    perspective(
-      radians(this.camera.fov),
-      frame.width / Math.max(1, frame.height),
-      this.camera.near, this.camera.far, this.#projection,
-    );
+    const insets = this.camera.insets;
+    if (insets.top === 0 && insets.left === 0 && insets.bottom === 0 && insets.right === 0) {
+      perspective(
+        radians(this.camera.fov),
+        frame.width / Math.max(1, frame.height),
+        this.camera.near, this.camera.far, this.#projection,
+      );
+    } else {
+      // Insets are points and the drawable is pixels; only the ratio matters, so measure the
+      // view in points rather than converting every inset.
+      const bounds = this.native.bounds();
+      insetPerspective(
+        radians(this.camera.fov),
+        Number(bounds.width), Number(bounds.height), insets,
+        this.camera.near, this.camera.far, this.#projection,
+      );
+    }
     multiply(this.#projection, this.#view, this.#viewProjection);
 
     this.#uniforms.write({

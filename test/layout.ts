@@ -26,6 +26,8 @@ import {
   snapshotWindow,
 } from "../src/ui/index.ts";
 import { pumpOnce } from "../src/runtime.ts";
+import { constants as C } from "../src/ui/appkit.ts";
+import { str } from "../src/objc.ts";
 
 const SHOTS = process.env.BUNKIT_SHOTS;
 let failures = 0;
@@ -128,6 +130,9 @@ const H = 500;
   show("03-form", w, stack);
 
   check("fixed label width honoured", Math.abs(label.alignmentRect.width - 60) < 0.5, label.alignmentRect.width);
+  // AppKit's own default for a label is to clip mid-letter; a squeezed label says "…" instead.
+  check("a label truncates with an ellipsis, not a clip", Number(label.native.lineBreakMode()) === Number(C.NSLineBreakByTruncatingTail), Number(label.native.lineBreakMode()));
+  check("and a middle-truncating one in the middle", Number(new Label({ text: "x", truncate: "middle" }).native.lineBreakMode()) === Number(C.NSLineBreakByTruncatingMiddle));
   check("field grew", field.frame.width > 300, field.frame.width);
   check("button kept intrinsic width", btn.frame.width > 20 && btn.frame.width < 120, btn.frame.width);
   check(
@@ -399,6 +404,23 @@ const H = 500;
       found.map((v) => v.detail).join("; ") || "detector never fires — it is vacuous");
     w.close();
   }
+}
+
+// ---------------------------------------------------------------------------
+// A dropdown draws the item that is selected — its own copy of it
+// ---------------------------------------------------------------------------
+{
+  const choices: string[] = [];
+  const sel = new Select({ items: ["One", "Two", "Three"], selected: 2, onChange: (_i, t) => choices.push(t) });
+  check("a dropdown shows the item it was built selected on", str(sel.native.title()) === "Three", str(sel.native.title()));
+  sel.selectedIndex = 0;
+  check("and the one it is set to", str(sel.native.title()) === "One", str(sel.native.title()));
+  sel.items = ["X", "Y"];
+  check("and new items show the first", str(sel.native.title()) === "X", str(sel.native.title()));
+  // A person's choice: AppKit selects the item, then sends the action.
+  sel.native.selectItemAtIndex_(1);
+  sel.native.sendAction_to_(sel.native.action(), sel.native.target());
+  check("a choice is drawn, and told", str(sel.native.title()) === "Y" && choices.at(-1) === "Y", { title: str(sel.native.title()), choices });
 }
 
 console.log(failures === 0 ? "\nALL LAYOUT TESTS PASSED" : `\n${failures} LAYOUT FAILURE(S)`);

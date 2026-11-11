@@ -10,12 +10,28 @@ import { AlertStyle, ModalResponse } from "./appkit.ts";
 import { nativeOf } from "./view.ts";
 import type { Window } from "./window.ts";
 
+/**
+ * The window a sheet hangs from: the one given, or the key window, the main window, or the
+ * first **visible** window — never one that has been closed. `windows` still lists a closed
+ * window that something holds, and a sheet hung from it brings it back on screen, frozen on its
+ * last frame. `undefined` when no window is on screen, and the caller falls back to an
+ * application-modal alert.
+ */
 function nativeWindow(w?: Window | any): any {
-  if (!w) {
-    const app = objc.NSApplication.sharedApplication();
-    return app.keyWindow() ?? app.mainWindow() ?? app.windows()?.firstObject?.();
+  if (w) return nativeOf(w);
+  const app = objc.NSApplication.sharedApplication();
+  const shown = (candidate: any) =>
+    candidate && candidate.ptr !== undefined && candidate.ptr !== 0n && Boolean(candidate.isVisible()) ? candidate : undefined;
+  const key = shown(app.keyWindow());
+  if (key) return key;
+  const main = shown(app.mainWindow());
+  if (main) return main;
+  const list = app.windows();
+  for (let i = 0; i < Number(list?.count?.() ?? 0); i++) {
+    const candidate = shown(list.objectAtIndex_(i));
+    if (candidate) return candidate;
   }
-  return nativeOf(w);
+  return undefined;
 }
 
 export interface AlertOptions {

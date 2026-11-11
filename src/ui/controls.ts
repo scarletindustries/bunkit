@@ -87,6 +87,13 @@ export interface LabelOptions extends ViewOptions {
   align?: "left" | "center" | "right";
   /** Wrap onto multiple lines instead of truncating. */
   wrap?: boolean;
+  /**
+   * Where a single line too long for its width loses text, behind an ellipsis — the end
+   * (default), the middle (a path, a long name whose end matters), or the start. AppKit's own
+   * default for a label is to **clip**, cutting a word mid-letter with nothing to say there was
+   * more; the HIG wants the ellipsis.
+   */
+  truncate?: "tail" | "middle" | "head";
   selectable?: boolean;
   lines?: number;
 }
@@ -114,6 +121,13 @@ export class Label extends View {
       );
     }
     if (o.selectable !== undefined) f.setSelectable_(o.selectable);
+    if (!o.wrap) {
+      f.setLineBreakMode_(
+        o.truncate === "middle" ? LineBreakMode.TruncatingMiddle
+        : o.truncate === "head" ? LineBreakMode.TruncatingHead
+        : LineBreakMode.TruncatingTail,
+      );
+    }
     if (o.wrap) {
       f.setLineBreakMode_(LineBreakMode.WordWrapping);
       f.cell().setWraps_(true);
@@ -578,29 +592,43 @@ export interface SelectOptions extends ViewOptions {
 export class Select extends View {
   #handler: ((i: number, t: string, s: Select) => void) | null = null;
 
+  /**
+   * A pop-up menu of titles. The button draws an item of its own rather than the one in the
+   * menu (`usesItemFromMenu` off, kept in step by {@link #showSelected}): drawing from the menu
+   * costs its layout a pass over every item, and a window of eight 16-item dropdowns took 87 ms
+   * to lay out, against 28 ms this way — on a main thread that renders a lighting show.
+   */
   constructor(options: SelectOptions = {}) {
     const p = objc.NSPopUpButton.alloc().initWithFrame_pullsDown_(
       { x: 0, y: 0, width: 120, height: 25 }, false,
     );
     super(p, options);
+    p.cell().setUsesItemFromMenu_(false);
+    // Always a target, handler or not: a choice has to update the item the button draws.
+    const target = actionTarget(() => {
+      this.#showSelected();
+      this.#handler?.(this.selectedIndex, this.selectedTitle, this);
+    });
+    this.retainJS(target);
+    p.setTarget_(target);
+    p.setAction_(ACTION_SELECTOR);
     if (options.items) this.items = options.items;
     if (options.selected !== undefined) this.selectedIndex = options.selected;
     if (options.enabled !== undefined) p.setEnabled_(options.enabled);
     if (options.onChange) this.onChange(options.onChange);
   }
 
+  /** Call `fn` when a person chooses an item. Replaces any handler set before. */
   onChange(fn: (i: number, t: string, s: Select) => void): this {
     this.#handler = fn;
-    const target = actionTarget(() => this.#handler?.(this.selectedIndex, this.selectedTitle, this));
-    this.retainJS(target);
-    this.native.setTarget_(target);
-    this.native.setAction_(ACTION_SELECTOR);
     return this;
   }
 
+  /** The titles, in order. Side effect: the first is selected, as AppKit does. */
   set items(v: string[]) {
     this.native.removeAllItems();
     for (const t of v) this.native.addItemWithTitle_(t);
+    this.#showSelected();
   }
 
   get selectedIndex(): number {
@@ -609,6 +637,13 @@ export class Select extends View {
 
   set selectedIndex(i: number) {
     this.native.selectItemAtIndex_(i);
+    this.#showSelected();
+  }
+
+  /** Draw the selected item on the button — a copy, since an item belongs to one menu. */
+  #showSelected(): void {
+    const item = this.native.selectedItem();
+    this.native.cell().setMenuItem_(item && item.ptr !== 0n ? item.copy() : null);
   }
 
   get selectedTitle(): string {

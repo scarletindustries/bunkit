@@ -17,6 +17,7 @@ import {
   lookAt,
   mat4,
   gpuAvailable,
+  insetPerspective,
   multiply,
   normalMatrix,
   perspective,
@@ -81,6 +82,25 @@ initApp();
   const z = p[2]! * near[0]! + p[6]! * near[1]! + p[10]! * near[2]! + p[14]! * near[3]!;
   const w = p[3]! * near[0]! + p[7]! * near[1]! + p[11]! * near[2]! + p[15]! * near[3]!;
   check("near plane maps to z=0 (Metal clip space, not GL)", close(z / w, 0, 1e-3), z / w);
+
+  // Content under glass: the projection is fitted to what is not covered. Where a point
+  // lands on screen, in points from the top left, for a view 1000×600.
+  const screen = (m: Float32Array, at: [number, number, number]) => {
+    const cx = m[0]! * at[0] + m[4]! * at[1] + m[8]! * at[2] + m[12]!;
+    const cy = m[1]! * at[0] + m[5]! * at[1] + m[9]! * at[2] + m[13]!;
+    const cw = m[3]! * at[0] + m[7]! * at[1] + m[11]! * at[2] + m[15]!;
+    return { x: (cx / cw * 0.5 + 0.5) * 1000, y: (1 - (cy / cw * 0.5 + 0.5)) * 600 };
+  };
+  const none = insetPerspective(radians(50), 1000, 600, { top: 0, left: 0, bottom: 0, right: 0 }, 0.1, 100);
+  const plain = perspective(radians(50), 1000 / 600, 0.1, 100);
+  check("with no insets it is the plain perspective", [...none].every((v, k) => close(v, plain[k]!, 1e-6)));
+  // A sidebar 250 wide on the left and a toolbar 50 tall: the visible rect is 250..1000 × 50..600.
+  const inset = insetPerspective(radians(50), 1000, 600, { top: 50, left: 250, bottom: 0, right: 0 }, 0.1, 100);
+  const ahead = screen(inset, [0, 0, -10]);
+  check("straight ahead lands in the middle of what is visible", close(ahead.x, 625, 1e-2) && close(ahead.y, 325, 1e-2), ahead);
+  const edge = Math.tan(radians(25)) * 10;
+  const top = screen(inset, [0, edge, -10]);
+  check("and the field of view spans the visible height", close(top.y, 50, 1e-2), top);
 
   // Looking down -Z from the origin puts the target straight ahead.
   const v = lookAt({ x: 0, y: 0, z: 5 }, { x: 0, y: 0, z: 0 }, { x: 0, y: 1, z: 0 });
