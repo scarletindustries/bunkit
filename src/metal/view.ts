@@ -147,6 +147,12 @@ export class GPUView extends View {
   #size = { width: 0, height: 0 };
   #start = 0;
   #last = 0;
+  /**
+   * The scene time of the last frame drawn or captured, seconds — what the next capture
+   * continues from. A host that drives `draw(time)` itself (rather than the view's own tick)
+   * sets it through that call, so a capture is a moment in the same timeline, not time zero.
+   */
+  #time = 0;
   #frame = 0;
   #skipped = 0;
   #cpuMs = 0;
@@ -389,6 +395,7 @@ export class GPUView extends View {
    */
   draw(time = 0, dt = 0): void {
     if (this.#disposed || this.#handlers.length === 0) return;
+    this.#time = time;
     // Retire finished buffers here too, not only from the tick: draw() is a
     // public entry point, and a caller driving frames by hand would otherwise
     // see gpuMs stuck at zero and the in-flight list grow without bound.
@@ -471,8 +478,19 @@ export class GPUView extends View {
    *
    * The same handlers run, so a capture is the same frame the view would have
    * drawn — which is how this is tested with nobody watching.
+   *
+   * Time carries on from the last frame drawn or captured, `dt` (default 1/60 s) later, so a
+   * run of captures is a run of consecutive frames — a strobe flashes, a dancer moves — rather
+   * than the same instant again. Pass `time` to render a particular moment instead.
    */
-  capture(width = 512, height = 384): { width: number; height: number; pixels: Uint8Array } {
+  capture(
+    width = 512,
+    height = 384,
+    options: { time?: number; dt?: number } = {},
+  ): { width: number; height: number; pixels: Uint8Array } {
+    const dt = options.dt ?? 1 / 60;
+    const time = options.time ?? this.#time + dt;
+    this.#time = time;
     // Attachments have to match the pipelines the handlers will set, and those
     // were built for this view's sample count. A multisampled pipeline drawing
     // into single-sampled attachments is a validation error that only shows up
@@ -497,7 +515,7 @@ export class GPUView extends View {
 
     this.gpu.submit((commands) => {
       const frame = new Frame(commands, {
-        time: this.#last - this.#start, dt: 1 / 60, index: this.#frame, width, height,
+        time, dt, index: this.#frame, width, height,
       });
       frame.colorTexture = color.native;
       frame.resolveTexture = multisampled ? readable.native : undefined;

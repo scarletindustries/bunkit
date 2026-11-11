@@ -977,5 +977,20 @@ kernel void shade(depth2d_array<float> maps [[texture(0)]],
   scene.dispose();
 }
 
+// --- a capture is a moment in the view's timeline, not time zero ----------------------
+{
+  const scene = new Scene3D({ animate: false, sampleCount: 1 });
+  const times: number[] = [];
+  scene.onFrame((frame) => times.push(frame.time));
+  scene.capture(8, 8);
+  scene.capture(8, 8);
+  check("consecutive captures are consecutive frames", Math.abs(times[1]! - times[0]! - 1 / 60) < 1e-9, times);
+  scene.capture(8, 8, { time: 12.5 });
+  check("a capture can be asked for a particular moment", times[2] === 12.5, times[2]);
+  scene.capture(8, 8, { dt: 0.1 });
+  check("and the next carries on from it", Math.abs(times[3]! - 12.6) < 1e-9, times[3]);
+  scene.dispose();
+}
+
 console.log(failures === 0 ? "\nALL GPU TESTS PASSED" : `\n${failures} GPU FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);
