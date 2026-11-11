@@ -13,6 +13,7 @@ const SUITES = [
   "test/types-check.ts",
   "test/layout.ts",
   "test/chrome.ts",
+  "test/video.ts",
   "test/metal.ts",
   "test/gpu.ts",
   "test/compile.ts",
