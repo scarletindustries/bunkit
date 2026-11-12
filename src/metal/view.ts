@@ -51,9 +51,9 @@
 // thread that is waiting. Reading commandBuffer.status() at the top of the next
 // tick asks the same question from the thread that is allowed to ask it.
 
-import { objc, withPool, wrap } from "../objc.ts";
+import { createBlock, globalObject, objc, withPool, wrap, type ObjCBlock } from "../objc.ts";
 import { lib, NIL } from "../bridge.ts";
-import { onViewFrame, setAnimating } from "../mainloop.ts";
+import { MainLoop, onViewFrame, setAnimating } from "../mainloop.ts";
 import { View, type ViewOptions } from "../ui/view.ts";
 import { input, type Input } from "../ui/input.ts";
 import {
@@ -113,6 +113,13 @@ export interface GPUViewStats {
    * See present.ts.
    */
   present: PresentStats;
+  /**
+   * Live resize (docs/main-loop/spec.md §5): frames drawn while the window was being resized,
+   * the size changes they followed, and frames whose drawable did not match the view's size when
+   * presented — a stretched frame. While a resize is live the view presents with the window's
+   * own transaction, and draws in the turn after each size change, so that stays 0.
+   */
+  liveResize: { frames: number; sizeChanges: number; mismatched: number };
   frame: number;
   drawableSize: { width: number; height: number };
 }
@@ -164,6 +171,11 @@ export class GPUView extends View {
   #fpsFrames = 0;
   #fpsMark = 0;
   #disposed = false;
+  /** The window is being resized: present with its transaction, draw after each size change. */
+  #live = false;
+  #livePosted = false;
+  #liveStats = { frames: 0, sizeChanges: 0, mismatched: 0 };
+  #observers: Array<{ token: any; block: ObjCBlock }> = [];
   readonly #present = new PresentTracker();
   /** The native thread that keeps a drawable ready. See `frameDue`. */
   #pump: bigint | null = null;
@@ -232,6 +244,7 @@ export class GPUView extends View {
     // Ask the run loop for its fast cadence while we are animating, so a 120 Hz
     // display is not capped by the idle 100 Hz tick.
     setAnimating(true);
+    this.#observeLiveResize();
     // On the display clock of the screen the view is on, so it draws at that screen's rate and
     // keeps drawing through live resize, menus and slider drags. Timed by when the frame will be
     // shown, not when the callback ran.
@@ -244,7 +257,66 @@ export class GPUView extends View {
     this.#stop();
     this.#stop = null;
     setAnimating(false);
+    this.#unobserve();
     return this;
+  }
+
+  /**
+   * Live resize, from the window's notifications and the view's own frame changes: the layer
+   * presents with the window's transaction from the moment a resize starts, so a frame reaches the
+   * screen with the window at the size it was drawn for, and each size change is followed by a
+   * frame in the very next turn, which runs inside the resize's tracking loop.
+   */
+  #observeLiveResize(): void {
+    if (this.#observers.length > 0) return;
+    const center = objc.NSNotificationCenter.defaultCenter();
+    const observe = (name: string, object: any, fn: (note: any) => void) => {
+      const block = createBlock("v@?@", fn);
+      const token = center.addObserverForName_object_queue_usingBlock_(globalObject(name), object, null, block);
+      this.#observers.push({ token, block });
+    };
+    const mine = (note: any) => {
+      const window = this.native.window();
+      return window && window.ptr !== NIL && note.object()?.ptr === window.ptr;
+    };
+    this.native.setPostsFrameChangedNotifications_(true);
+    observe("NSWindowWillStartLiveResizeNotification", null, (note) => {
+      if (!mine(note)) return;
+      this.#live = true;
+      this.layer.setPresentsWithTransaction_(true);
+    });
+    observe("NSWindowDidEndLiveResizeNotification", null, (note) => {
+      if (!mine(note)) return;
+      this.#live = false;
+      this.layer.setPresentsWithTransaction_(false);
+    });
+    observe("NSViewFrameDidChangeNotification", this.native, () => {
+      if (!this.#live) return;
+      this.#liveStats.sizeChanges++;
+      if (this.#livePosted) return;
+      this.#livePosted = true;
+      MainLoop.post(() => {
+        this.#livePosted = false;
+        if (!this.#stop || this.#disposed || this.#reap() >= this.#maxInFlight) return;
+        const now = lib.br_now() as number;
+        if (this.#start === 0) this.#start = now;
+        this.#last = now;
+        this.draw(now - this.#start, 0);
+      });
+    });
+  }
+
+  #unobserve(): void {
+    const center = objc.NSNotificationCenter.defaultCenter();
+    for (const { token, block } of this.#observers) {
+      center.removeObserver_(token);
+      block.dispose();
+    }
+    this.#observers = [];
+    if (this.#live) {
+      this.#live = false;
+      this.layer.setPresentsWithTransaction_(false);
+    }
   }
 
   /**
@@ -304,6 +376,7 @@ export class GPUView extends View {
       gpuMs: this.#gpuMs,
       skipped: this.#skipped,
       ready: this.#ready,
+      liveResize: { ...this.#liveStats },
       frame: this.#frame,
       drawableSize: { ...this.#size },
       present: this.#present.stats,
@@ -352,6 +425,17 @@ export class GPUView extends View {
     const dt = now - this.#last;
     this.#last = now;
     this.draw(now - this.#start, dt);
+  }
+
+  /** The view's backing size now, in pixels, without changing anything. */
+  #syncSizeNow(): { width: number; height: number } {
+    const bounds = this.native.bounds();
+    const window = this.native.window();
+    const scale = window ? Number(window.backingScaleFactor()) : 2;
+    return {
+      width: Math.max(1, Math.round(bounds.width * scale)),
+      height: Math.max(1, Math.round(bounds.height * scale)),
+    };
   }
 
   /** Size the drawable and the attachments to the view's backing store. */
@@ -460,8 +544,22 @@ export class GPUView extends View {
         }
       }
 
-      commands.presentDrawable_(drawable);
-      commands.commit();
+      if (this.#live) {
+        // With the window's transaction: scheduled first, then shown with whatever else the
+        // resize changes in the same commit, so the window and the frame change size together.
+        commands.commit();
+        commands.waitUntilScheduled();
+        drawable.present();
+        this.#liveStats.frames++;
+        const texture = drawable.texture();
+        const now = this.#syncSizeNow();
+        if (Number(texture.width()) !== now.width || Number(texture.height()) !== now.height) {
+          this.#liveStats.mismatched++;
+        }
+      } else {
+        commands.presentDrawable_(drawable);
+        commands.commit();
+      }
       this.#present.track(drawable as PresentedDrawable, drawnMs);
       // Retained past the pool: #reap polls its status on a later tick.
       this.#inFlight.push(commands.retain());

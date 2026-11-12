@@ -8,13 +8,14 @@
 // appended to one event list under a lock, and JavaScript takes the events in
 // batches with br_net_poll.
 //
-// JavaScript learns there is something to take from a `threadsafe` bun:ffi
-// callback, called at most once between two polls (the list going from empty
-// to not), which queues a task on Bun's event loop, and from an empty NSEvent
-// (br_wake_pump, one outstanding at a time) that ends a pump asleep in AppKit
-// or stops the next one sleeping. The callback runs nothing but a wake-up: the
-// drain itself is ordinary JavaScript on the main thread. A small message's
-// round trip is 0.12 ms median, 0.15 ms inside BunKit's run loop.
+// JavaScript learns there is something to take at most once between two polls
+// (the list going from empty to not), two ways at once. BunKit's main loop is
+// signalled (br_main_signal), and its turn — which runs inside the pump and inside
+// any nested loop AppKit is running, a menu or a live resize — takes the events.
+// And a `threadsafe` bun:ffi callback queues a task on Bun's event loop, for a
+// process that is not pumping or net used from a thread. Whichever runs first
+// drains; the drain itself is ordinary JavaScript on the main thread. A small
+// message's round trip is 0.12 ms median, 0.15 ms inside BunKit's run loop.
 //
 // Why a private queue and not the main queue. Measured on an M2 Pro (macOS
 // 26.6) over loopback: on the main queue the handlers run only while the pump
@@ -219,14 +220,18 @@ static void emit(uint32_t kind, uint32_t id, int32_t a, uint64_t b, void* ptr, u
   g_notified = 1;
   pthread_mutex_unlock(&g_events_lock);
   if (!wake) return;
-  // Under its own lock so br_net_shutdown can be sure no call is in flight once
-  // it returns. The callback only queues a task on Bun's loop; it never blocks.
+  // BunKit's main loop: its work source fires inside the pump and inside any nested
+  // loop AppKit is running — a menu, a live resize — and the turn takes the events
+  // (docs/main-loop/spec.md §7.5). A pump asleep in AppKit comes back at once.
+  atomic_fetch_or(&g_br_main.pending, BR_PENDING_NET);
+  br_main_signal();
+  // And Bun's loop, for a process that is not pumping, or net used from a thread:
+  // whichever drains first takes the events. Under its own lock so br_net_shutdown
+  // can be sure no call is in flight once it returns. The callback only queues a
+  // task on Bun's loop; it never blocks.
   pthread_mutex_lock(&g_notify_lock);
   if (g_notify) g_notify();
   pthread_mutex_unlock(&g_notify_lock);
-  // A pump asleep in AppKit comes back now rather than at its timeout, and one
-  // about to start does not go to sleep.
-  br_wake_pump();
 }
 
 static char* copy_text(const char* s) { return s ? strdup(s) : NULL; }

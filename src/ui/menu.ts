@@ -1,7 +1,7 @@
 // Menus. A macOS app without a proper menu bar feels broken, so `standardMenu()`
 // builds the conventional one and you add your own items to it.
 
-import { createBlock, globalObject, objc, sendFromPump, str } from "../objc.ts";
+import { createBlock, globalObject, nativeOf, objc, sendFromPump, str } from "../objc.ts";
 import { quit as runtimeQuit } from "../runtime.ts";
 import { ACTION_SELECTOR, actionTarget } from "./view.ts";
 import { EventModifierFlags } from "./appkit.ts";
@@ -288,7 +288,7 @@ export async function popUpMenu(items: MenuItemSpec[] | Menu, view?: any): Promi
   const app = objc.NSApplication.sharedApplication();
   // Captured now: by the time the pump opens the menu, the event in hand is another one.
   const event = app.currentEvent();
-  const native = view ? (view.native ?? view) : null;
+  const native = view ? nativeOf(view) : null;
   let chosen: MenuItemSpec | undefined;
   const center = objc.NSNotificationCenter.defaultCenter();
   // Posted when a menu item's action is sent: whichever item it was, onClick or responder chain.

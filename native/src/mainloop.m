@@ -156,19 +156,33 @@ int32_t br_main_take_stalls(void* out, int32_t cap) {
 // The turn
 // ---------------------------------------------------------------------------
 
+static void deadline_fired(CFRunLoopTimerRef timer, void* info);
+
+// A new one-shot timer for every deadline, not one timer moved with CFRunLoopTimerSetNextFireDate.
+// Measured: moved from inside its own callout — the turn it fires runs there — a timer in the
+// common modes is re-armed only in the mode the callout ran in. Fired inside a live resize's
+// tracking loop and moved there, it never fired again in the default mode, its date passed, until
+// some other timer re-armed that mode: 4 s with nothing of the main loop's running. A timer that
+// is added to the run loop is armed in every mode it is in.
 static void arm_deadline(void) {
-  if (!g_deadline) return;
+  if (!g_rl) return;
   double due = g_br_main.nextDue;
   double delay = g_br_main.nextDelay;
   if (delay < 0) {
     if (g_armed_due < 0) return;
-    g_armed_due = -1;
-    CFRunLoopTimerSetNextFireDate(g_deadline, CFAbsoluteTimeGetCurrent() + 1e9);
+  } else if (due == g_armed_due && g_deadline && CFRunLoopTimerIsValid(g_deadline)) {
     return;
   }
-  if (due == g_armed_due) return;
-  g_armed_due = due;
-  CFRunLoopTimerSetNextFireDate(g_deadline, CFAbsoluteTimeGetCurrent() + delay);
+  if (g_deadline) {
+    CFRunLoopTimerInvalidate(g_deadline);
+    CFRelease(g_deadline);
+    g_deadline = NULL;
+  }
+  g_armed_due = delay < 0 ? -1 : due;
+  if (delay < 0) return;
+  g_deadline = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + delay, 0, 0, 0,
+                                    deadline_fired, NULL);
+  CFRunLoopAddTimer(g_rl, g_deadline, kCFRunLoopCommonModes);
 }
 
 static void run_turn(void) {
@@ -190,8 +204,11 @@ static void run_turn(void) {
 }
 
 // The source, the deadline timer or a clock fired: a turn now, or at the next safe point.
+static void finish_unsafe(void);
+
 static void fire(void) {
   if (br_main_is_safe()) {
+    finish_unsafe();
     run_turn();
   } else if (!atomic_exchange(&g_br_main.pendingTurn, 1)) {
     g_stats.deferred += 1;
@@ -360,8 +377,13 @@ static int g_entry_depth;
 // entry at the depth it waits at is its own.
 static int g_pump_waiting;
 static int g_pump_wait_depth;
+// A hold with JavaScript on the stack: from its first entry to the last exit before the main
+// thread next reaches a safe point. One JavaScript call that runs the loop over and over —
+// -runMode:beforeDate: in a loop — is one hold, not one per run.
 static int g_unsafe_open;
+static int g_unsafe_pending;  // exited, and no safe point since: the next entry continues it
 static double g_unsafe_start;
+static double g_unsafe_last_exit;
 static int g_unsafe_mode;
 static uint32_t g_unsafe_seq;
 static uint32_t g_next_seq = 1;
@@ -381,6 +403,19 @@ typedef struct {
 
 static br_nested g_nested[RING];
 static int g_nested_count;
+
+// A safe point: a hold with JavaScript on the stack that has exited is over. Reported now.
+static void finish_unsafe(void) {
+  if (!g_unsafe_pending || g_unsafe_open) return;
+  g_unsafe_pending = 0;
+  double ms = (g_unsafe_last_exit - g_unsafe_start) * 1000;
+  record_nested(ms, g_unsafe_mode, 1);
+  record_stall(ms, g_unsafe_mode, 1);
+  if (g_nested_count < RING) {
+    g_nested[g_nested_count++] = (br_nested){g_unsafe_seq, g_unsafe_mode, ms, g_unsafe_last_exit};
+    atomic_fetch_or(&g_br_main.pending, BR_PENDING_NESTED);
+  }
+}
 
 int32_t br_main_take_nested(void* out, int32_t cap) {
   int n = g_nested_count < cap ? g_nested_count : cap;
@@ -431,7 +466,9 @@ static void observe(CFRunLoopObserverRef observer, CFRunLoopActivity activity, v
     if (mode) CFRelease(mode);
     if (g_pump_waiting && g_entry_depth == g_pump_wait_depth) {
       e.kind = 0;
+      finish_unsafe();
     } else if (br_main_is_safe()) {
+      finish_unsafe();
       if (g_dispatch_depth > 0) {
         e.kind = 1;
         if (!g_dispatch_nested) g_dispatch_mode = e.mode;
@@ -441,7 +478,7 @@ static void observe(CFRunLoopObserverRef observer, CFRunLoopActivity activity, v
       }
     } else {
       e.kind = 2;
-      if (g_unsafe_open++ == 0) {
+      if (g_unsafe_open++ == 0 && !g_unsafe_pending) {
         g_unsafe_start = e.start;
         g_unsafe_mode = e.mode;
         g_unsafe_seq = g_next_seq++;
@@ -467,13 +504,8 @@ static void observe(CFRunLoopObserverRef observer, CFRunLoopActivity activity, v
       record_nested(ms, e.mode, 0);
       record_stall(ms, e.mode, 0);
     } else if (e.kind == 2 && --g_unsafe_open == 0) {
-      double ms = (br_now() - g_unsafe_start) * 1000;
-      record_nested(ms, g_unsafe_mode, 1);
-      record_stall(ms, g_unsafe_mode, 1);
-      if (g_nested_count < RING) {
-        g_nested[g_nested_count++] = (br_nested){g_unsafe_seq, g_unsafe_mode, ms, br_now()};
-        atomic_fetch_or(&g_br_main.pending, BR_PENDING_NESTED);
-      }
+      g_unsafe_pending = 1;
+      g_unsafe_last_exit = br_now();
     }
   }
 }
@@ -484,6 +516,7 @@ static void observe(CFRunLoopObserverRef observer, CFRunLoopActivity activity, v
 
 void br_main_run_pending(void) {
   if (!br_main_is_safe()) return;
+  finish_unsafe();
   run_items();
   if (atomic_load(&g_br_main.pendingTurn) && br_main_is_safe()) run_turn();
 }
@@ -607,11 +640,7 @@ int br_main_clock_open(uint32_t displayID) {
       NSInteger fps = [screen respondsToSelector:@selector(maximumFramesPerSecond)]
                           ? [screen maximumFramesPerSecond] : 60;
       c->interval = 1.0 / (double)(fps > 0 ? fps : 60);
-      CFRunLoopTimerContext ctx = {0, c, NULL, NULL, NULL};
-      c->timer = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 1e9, c->interval, 0, 0,
-                                      clock_timer_fired, &ctx);
-      CFRunLoopAddTimer(g_rl ? g_rl : CFRunLoopGetMain(), c->timer, kCFRunLoopCommonModes);
-      s->fallback = 1;
+      s->fallback = 1;  // its timer is made when it starts
     }
     g_clock_objects[slot] = c;
   }
@@ -628,8 +657,19 @@ void br_main_clock_run(int slot, int on) {
   else atomic_fetch_sub(&g_br_main.clocksRunning, 1);
   if (!on) atomic_store(&s->due, 0);
   if (c->link) [c->link setPaused:on ? NO : YES];
-  if (c->timer) {
-    CFRunLoopTimerSetNextFireDate(c->timer, CFAbsoluteTimeGetCurrent() + (on ? c->interval : 1e9));
+  if (s->fallback) {
+    // Made anew each start, never moved: see arm_deadline.
+    if (c->timer) {
+      CFRunLoopTimerInvalidate(c->timer);
+      CFRelease(c->timer);
+      c->timer = NULL;
+    }
+    if (on) {
+      CFRunLoopTimerContext ctx = {0, c, NULL, NULL, NULL};
+      c->timer = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + c->interval, c->interval,
+                                      0, 0, clock_timer_fired, &ctx);
+      CFRunLoopAddTimer(g_rl, c->timer, kCFRunLoopCommonModes);
+    }
   }
 }
 
@@ -671,11 +711,6 @@ void br_main_init(void* turn, void* stack, void* wake) {
   ctx.perform = source_perform;
   g_source = CFRunLoopSourceCreate(NULL, 0, &ctx);
   CFRunLoopAddSource(g_rl, g_source, kCFRunLoopCommonModes);
-  // Repeating, with an interval no one will reach, so firing never invalidates it: re-armed
-  // with CFRunLoopTimerSetNextFireDate after every turn that changes the earliest deadline.
-  g_deadline = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 1e9, 1e9, 0, 0,
-                                    deadline_fired, NULL);
-  CFRunLoopAddTimer(g_rl, g_deadline, kCFRunLoopCommonModes);
   // First in, last out, so it brackets everything else on the run loop.
   CFRunLoopObserverRef observer = CFRunLoopObserverCreate(
       NULL, kCFRunLoopEntry | kCFRunLoopExit, true, LONG_MIN, observe, NULL);
@@ -698,3 +733,4 @@ void br_main_shutdown(void) {
   g_turn = NULL;
   g_stack = NULL;
 }
+

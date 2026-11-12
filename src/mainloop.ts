@@ -792,11 +792,8 @@ function turn(): void {
   turning = true;
   signalled = false;
   try {
+    // Reports first, so a stall or a nesting is heard before the call it came from resolves.
     pendingBits |= Atomics.exchange(U, U_PENDING, 0);
-    if (pendingBits & PENDING_COMPLETIONS) {
-      pendingBits &= ~PENDING_COMPLETIONS;
-      takeCompletions();
-    }
     if (pendingBits & PENDING_NESTED) {
       pendingBits &= ~PENDING_NESTED;
       takeNested();
@@ -809,6 +806,10 @@ function turn(): void {
       const stall = longTurn;
       longTurn = undefined;
       deliverStall(stall);
+    }
+    if (pendingBits & PENDING_COMPLETIONS) {
+      pendingBits &= ~PENDING_COMPLETIONS;
+      takeCompletions();
     }
     for (;;) {
       let ran = runTimers(deadline);

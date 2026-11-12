@@ -331,6 +331,9 @@ export interface ChannelStats {
   signals: number;
   /** Times the other end woke this one. */
   wakeups: number;
+  /** What the other end has sent, and how many of its messages it dropped. */
+  peerSent: number;
+  peerDropped: number;
 }
 
 type Handler = (message: any) => void;
@@ -414,6 +417,8 @@ export class Channel {
       dropped: out.dropped,
       signals: out.signals,
       wakeups: inbound.signals,
+      peerSent: inbound.sent,
+      peerDropped: inbound.dropped,
     };
   }
 
@@ -478,9 +483,16 @@ export interface CellLayout<T extends CellValue> {
  *
  *   const Safety = cellLayout("safety", { live: true, haze: 1, masters: 1 });
  */
-export function cellLayout<T extends CellValue>(name: string, defaults: T): CellLayout<T> {
-  return { name, fields: Object.keys(defaults) as (keyof T & string)[], defaults: { ...defaults } };
+export function cellLayout<T extends CellValue>(name: string, defaults: T): CellLayout<Widen<T>> {
+  return {
+    name,
+    fields: Object.keys(defaults) as (keyof T & string)[],
+    defaults: { ...defaults } as unknown as Widen<T>,
+  };
 }
+
+/** `{ on: false }` describes a boolean field, not one that is always false. */
+type Widen<T> = { [K in keyof T]: T[K] extends boolean ? boolean : number };
 
 const CELL_HEADER = 8; // an Int32 sequence word, padded to the first float
 
