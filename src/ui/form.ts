@@ -8,6 +8,8 @@
 // thousand points wide.
 import { HStack, Separator, Spacer, VStack } from "./layout.ts";
 import { Label } from "./controls.ts";
+import { LayoutAttribute, LayoutRelation } from "./appkit.ts";
+import { objc } from "../objc.ts";
 import type { View, ViewOptions } from "./view.ts";
 
 /** One row of a {@link formSection}: a label, the controls, and a short note after them. */
@@ -104,7 +106,7 @@ function formRow(row: FormRow, labelWidth: number, textWidth: number): HStack {
     children.push(new Label({ text: row.note, font: { size: 11 }, color: "secondaryLabel", wrap: true, maxWidth: Math.min(textWidth, 200) }));
   }
   children.push(new Spacer());
-  return new HStack({ spacing: 10, padding: { top: 8, bottom: 8, left: 12, right: 12 }, align: "center" }, children);
+  return held(new HStack({ spacing: 10, padding: { top: 8, bottom: 8, left: 12, right: 12 }, align: "center" }, children));
 }
 
 /**
@@ -130,7 +132,45 @@ function trailingRow(row: FormRow, labelWidth: number): HStack {
   children.push(new Spacer());
   children.push(...row.controls);
   // The same insets as a leading row, a little taller: a row of one switch is still a row.
-  return new HStack({ spacing: 10, padding: { top: 8, bottom: 8, left: 12, right: 12 }, align: "center", minHeight: 40 }, children);
+  return held(new HStack({ spacing: 10, padding: { top: 8, bottom: 8, left: 12, right: 12 }, align: "center", minHeight: 40 }, children));
+}
+
+/** A row's padding above and below its tallest view, in points. */
+const ROW_INSET = 8;
+
+/**
+ * Make a centred row keep its top and bottom insets, whatever is in it. Required constraints:
+ * every view in the row stays at least {@link ROW_INSET} from the row's top and bottom, so the
+ * row is its tallest view plus the insets, and the shorter ones stay centred.
+ *
+ * Needed because the stack's own `edgeInsets` don't hold on this axis. In a stack whose views are
+ * centred across it, `NSStackView` asks for the insets only at its hugging priority (250 by
+ * default), as an *equality* per view, with nothing but `>= 0` required — so the row shrank to
+ * its tallest view and the padding went (measured: a title over a two-line note sat 1 point under
+ * the hairline above it, and a note wrapped narrower than it was measured lost its last line).
+ * Raising that priority is no fix: the equalities of a 24-point switch and a 46-point label can't
+ * both hold, and at 750 the switch won and the label was squashed to 6 points.
+ *
+ * Side effect: adds two constraints per view (not the spacer, which has no height of its own) and
+ * keeps them alive with the row. Returns the row.
+ */
+function held(row: HStack): HStack {
+  const views = row.children.filter((child) => !(child instanceof Spacer));
+  for (const view of views) {
+    for (const [first, second, attribute] of [
+      [view.native, row.native, LayoutAttribute.Top],
+      [row.native, view.native, LayoutAttribute.Bottom],
+    ] as const) {
+      // first.attr >= second.attr + inset, read as: the view's top is at least an inset below
+      // the row's, and the row's bottom at least an inset below the view's.
+      const c = objc.NSLayoutConstraint.constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant_(
+        first, attribute, LayoutRelation.GreaterThanOrEqual, second, attribute, 1.0, ROW_INSET,
+      );
+      c.setActive_(true);
+      row.retainJS(c);
+    }
+  }
+  return row;
 }
 
 /** A view given as a row, inset as the rows are. */

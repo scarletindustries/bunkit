@@ -348,6 +348,29 @@ const secondRow = settingsGroup.children[2] as VStack;
 check("a leading view takes the label's place", secondRow.children[0] === leadingView);
 const leadingColumns = formSection({ rows: [{ leading: leadingView, controls: [] }] });
 check("in a column layout too", ((leadingColumns.children[0] as VStack).children[0] as VStack).children[0] === leadingView);
+// A row keeps its insets above and below its tallest view. NSStackView held them only at 250,
+// as equalities, so a title over a two-line note filled its row to the hairline — and a note
+// wrapped narrower than it was measured lost its last line.
+const twoLines = formSection({
+  controls: "trailing",
+  labelWidth: 160,
+  rows: [
+    { label: "Dev Mode", controls: [new Label({ text: "Off" })], note: "Play songs on this Mac, with outputs 3 and up mixed into 1 and 2." },
+    { label: "Name", controls: [new Label({ text: "Panes" })] },
+  ],
+});
+const twoLineRow = (twoLines.children[0] as VStack).children[0] as VStack;
+const twoLineColumn = twoLineRow.children[0] as VStack;
+const columnHeight = Number(twoLineColumn.native.fittingSize().height);
+const rowHeight = Number(twoLineRow.native.fittingSize().height);
+check("a two-line row is its label column and 8 points above and below", Math.abs(rowHeight - (columnHeight + 16)) < 0.5, { rowHeight, columnHeight });
+check("its note really is two lines", columnHeight > 40, columnHeight);
+const oneLineRow = (twoLines.children[0] as VStack).children[2] as VStack;
+check("a row of one line keeps its 40-point floor", Math.abs(Number(oneLineRow.native.fittingSize().height) - 40) < 0.5, Number(oneLineRow.native.fittingSize().height));
+const columnRow = (formSection({ rows: [{ label: "Output", controls: [new Label({ text: "Two\nlines" })] }] }).children[0] as VStack).children[0] as VStack;
+const tallest = Math.max(...columnRow.children.map((child) => Number(child.native.fittingSize().height)));
+check("and a column-layout row is inset the same way", Math.abs(Number(columnRow.native.fittingSize().height) - (tallest + 16)) < 0.5, { row: Number(columnRow.native.fittingSize().height), tallest });
+
 check("fixed-width digits are a font", makeFont({ size: 11, digits: true }) !== null);
 
 // A segmented control's outline: a capsule, to sit inside a glass capsule (macOS 26).
