@@ -53,7 +53,7 @@
 
 import { objc, withPool, wrap } from "../objc.ts";
 import { lib, NIL } from "../bridge.ts";
-import { onFrame, setAnimating } from "../runtime.ts";
+import { onViewFrame, setAnimating } from "../mainloop.ts";
 import { View, type ViewOptions } from "../ui/view.ts";
 import { input, type Input } from "../ui/input.ts";
 import {
@@ -232,7 +232,10 @@ export class GPUView extends View {
     // Ask the run loop for its fast cadence while we are animating, so a 120 Hz
     // display is not capped by the idle 100 Hz tick.
     setAnimating(true);
-    this.#stop = onFrame((now) => this.#tick(now));
+    // On the display clock of the screen the view is on, so it draws at that screen's rate and
+    // keeps drawing through live resize, menus and slider drags. Timed by when the frame will be
+    // shown, not when the callback ran.
+    this.#stop = onViewFrame(this, (frame) => this.#tick(frame.targetTimestamp), "GPUView");
     return this;
   }
 

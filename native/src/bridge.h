@@ -174,6 +174,83 @@ void br_post_empty_event(void);
 void br_wake_pump(void); // from any thread: one empty event, unless one is already waiting
 double br_now(void);
 
+// --- the main loop (mainloop.m) — docs/main-loop/spec.md ------------------
+//
+// State both sides read: a static JavaScript views as a Uint32Array (the first 16 words) and a
+// Float64Array (from byte 64), so keeping it costs no FFI call. src/mainloop.ts mirrors the
+// indices. Words written off the main thread are atomic.
+typedef struct br_main_state {
+  _Atomic uint32_t callbackDepth;  // [0] native → JavaScript entries in progress
+  _Atomic uint32_t inPump;         // [1] br_pump calls in progress
+  _Atomic uint32_t inTurn;         // [2] a turn is running
+  _Atomic uint32_t pendingTurn;    // [3] a turn came due off a safe point; br_pump runs it
+  _Atomic uint32_t pending;        // [4] BR_PENDING_* bits: native work waiting for a turn
+  _Atomic uint32_t bunIdle;        // [5] run() is idle-waiting in Bun (set by JavaScript)
+  _Atomic uint32_t bunWake;        // [6] a wake-up of Bun's loop is outstanding
+  _Atomic uint32_t screens;        // [7] bumped when screens change or a window changes screen
+  _Atomic uint32_t nesting;        // [8] run-loop runs in progress on the main thread
+  _Atomic uint32_t clocksRunning;  // [9] frame clocks running
+  _Atomic uint32_t signalled;      // [10] the work source is signalled and has not run yet
+  uint32_t _u32[5];                // [11..15]
+  double nextDelay;                // f64 [8]  seconds to the main loop's next deadline, < 0 none (JS writes in a turn)
+  double stallMs;                  // f64 [9]  report holds at least this long as stalls, 0 = none (JS writes)
+  double nextDue;                  // f64 [10] that deadline in JavaScript's own clock: unchanged means armed
+  double _f64[5];                  // f64 [11..15]
+} br_main_state;
+
+extern br_main_state g_br_main;
+
+enum {
+  BR_PENDING_FRAMES = 1,       // a frame clock fired
+  BR_PENDING_COMPLETIONS = 2,  // a trampolined call finished
+  BR_PENDING_NET = 4,          // net.m has events
+  BR_PENDING_NESTED = 8,       // a nested loop started by JavaScript ended (§6.2)
+  BR_PENDING_STALLS = 16,      // a hold past the stall threshold ended (§8)
+};
+
+// A frame clock: one display link per screen. JavaScript views the array of them.
+#define BR_MAX_CLOCKS 16
+typedef struct br_clock_slot {
+  _Atomic uint32_t due;     // fired, and not yet delivered
+  uint32_t displayID;       // CGDirectDisplayID, 0 for a free slot
+  uint32_t running;
+  uint32_t fallback;        // driven by a run-loop timer: no display link on this macOS
+  double timestamp;         // CADisplayLink's: the frame's, the next one's, and the interval
+  double targetTimestamp;
+  double duration;
+  double fired;             // callbacks from the display link
+  double missed;            // fires that found the last one still undelivered
+  double _pad;
+} br_clock_slot;
+
+void* br_main_state_ptr(void);
+void* br_main_clocks_ptr(void);
+void  br_main_init(void* turn, void* stack, void* wake);
+void  br_main_shutdown(void);
+void  br_main_signal(void);                 // from any thread
+void  br_main_arm(double delaySeconds);     // main thread; < 0 disarms
+int   br_main_clock_open(uint32_t displayID);
+void  br_main_clock_run(int slot, int on);
+uint32_t br_main_display_of(void* view);    // the display a view's window is on, 0 for none
+uint32_t br_main_main_display(void);
+// Trampolined calls (§6.1): a message sent from the pump, with no JavaScript on the stack.
+uint32_t br_main_post_send(void* target, void* sel, const char* types, const void* argbuf,
+                           int32_t argSize);
+int32_t  br_main_take_completions(void* out, int32_t cap);
+int32_t  br_main_take_nested(void* out, int32_t cap);
+int32_t  br_main_take_stalls(void* out, int32_t cap);
+const char* br_main_mode_name(int32_t index);
+void     br_main_stats(double* out, int32_t cap);
+void     br_main_stats_reset(void);
+// Called by runloop.m.
+int   br_main_is_safe(void);
+void  br_main_run_pending(void);            // run a turn left pending, if at a safe point now
+int   br_main_pump_wait_begin(void);       // returns what br_main_pump_wait_end restores
+void  br_main_pump_wait_end(int previous);
+void  br_main_dispatch_begin(void);
+void  br_main_dispatch_end(void);
+void  br_main_pump_end(double seconds);
+
 // --- drawables, taken off the main thread (drawables.m) --------------------
 void* br_drawables_create(void* layer);
 void  br_drawables_arm(void* pump, int on);

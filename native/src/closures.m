@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <alloca.h>
+#include <stdatomic.h>
 #include "bridge.h"
 
 // The single fixed-signature entry point back into JS. Bun declares this as
@@ -68,11 +69,15 @@ static void br_trampoline(ffi_cif* cif, void* ret, void** args, void* user) {
     inst = br_object_get_token(self_);
   }
 
+  // Counted, so the main loop never starts a turn while this is on the stack
+  // (docs/main-loop/spec.md §3). A plain add on a word JavaScript reads directly.
+  atomic_fetch_add_explicit(&g_br_main.callbackDepth, 1, memory_order_relaxed);
   @try {
     ctx->jsfn(ctx->token, inst, argbuf, ret);
   } @catch (NSException* e) {
     NSLog(@"[objcbridge] exception escaping JS callback: %@", e);
   }
+  atomic_fetch_sub_explicit(&g_br_main.callbackDepth, 1, memory_order_relaxed);
 }
 
 static br_ctx* make_closure(const char* types, void* jsfn, uint32_t token, int isBlock) {

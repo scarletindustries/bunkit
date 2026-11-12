@@ -32,6 +32,7 @@ import {
   type ArgInfo,
 } from "./bridge.ts";
 import { structDef, STRUCTS } from "./structs.ts";
+import { awaitCompletion } from "./mainloop.ts";
 
 const le = true;
 
@@ -918,6 +919,59 @@ function dispatch(
     for (const p of temps.raw) lib.br_release(p);
     releaseSlot();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Trampolined calls (docs/main-loop/spec.md §6.1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Send a message from the pump instead of from here, and resolve with its result in the turn
+ * after it returns.
+ *
+ *   const chosen = await sendFromPump(menu, "popUpMenuPositioningItem:atLocation:inView:", null, at, null);
+ *
+ * For a call that runs a nested loop of its own — a context menu, a modal session, a
+ * `-runModal…` — made from JavaScript, that loop would run with your function suspended
+ * mid-statement, and the main loop would wait for it (§3). Sent from the pump instead, nothing of
+ * yours is on the stack: it is a nested loop "from event dispatch", inside which main-loop timers,
+ * frames and channel messages keep running. The arguments are marshalled now; every object among
+ * them is retained until the call is made, at the pump's next safe point.
+ *
+ * Needs the app's loop (`run()` or `pumpOnce`) to make the call at all.
+ */
+export function sendFromPump(target: ObjCObject, selector: string, ...args: any[]): Promise<any> {
+  const isCls = target instanceof ObjCClass;
+  const lookup = isCls ? target.ptr : (lib.br_object_class(target.ptr) as bigint);
+  const selName = selector.includes(":") || !selector.includes("_") ? selector : toSelector(selector);
+  const r = resolve(lookup, selName, !isCls);
+  if (!r) {
+    const clsName = String(lib.br_object_class_name(lookup));
+    throw new Error(`${isCls ? "+" : "-"}[${clsName} ${selName}] is not implemented (unrecognized selector)`);
+  }
+  const L = r.layout;
+  if (args.length !== L.userArgs) {
+    throw new TypeError(`${selName} expects ${L.userArgs} argument${L.userArgs === 1 ? "" : "s"}, got ${args.length}`);
+  }
+  const slot = acquire(L.argbufSize, L.retbufSize);
+  const temps: Temps = { raw: [], keep: [] };
+  let token = 0;
+  try {
+    slot.argBytes.fill(0, 0, L.argbufSize);
+    for (let i = 0; i < L.userArgs; i++) {
+      writeArg(slot.argView, L.args[i + 2]!, r.split.args[i + 2]!, args[i], temps, `${selName} arg ${i}`);
+    }
+    // The native side retains the target and every object argument until the call is made.
+    token = lib.br_main_post_send(target.ptr, r.selPtr, r.typesBuf, slot.argPtr, L.argbufSize) as number;
+  } finally {
+    for (const p of temps.raw) lib.br_release(p);
+    releaseSlot();
+  }
+  if (!token) throw new Error(`${selName}: could not post it to the pump`);
+  // An object result comes back retained (+1) by the native side.
+  const owned = L.ret.kind === K.OBJECT || L.ret.kind === K.BLOCK;
+  return awaitCompletion(token, selName, (view, offset) =>
+    readValue(view, offset, L.ret.kind, L.ret.size, r.split.ret, owned));
 }
 
 // ---------------------------------------------------------------------------

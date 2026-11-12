@@ -1,7 +1,7 @@
 // Menus. A macOS app without a proper menu bar feels broken, so `standardMenu()`
 // builds the conventional one and you add your own items to it.
 
-import { objc, str } from "../objc.ts";
+import { createBlock, globalObject, objc, sendFromPump, str } from "../objc.ts";
 import { quit as runtimeQuit } from "../runtime.ts";
 import { ACTION_SELECTOR, actionTarget } from "./view.ts";
 import { EventModifierFlags } from "./appkit.ts";
@@ -67,6 +67,9 @@ const menuTargets: any[] = [];
 
 export class Menu {
   readonly native: any;
+  /** What each item was made from, by the item's pointer: how a chosen item is reported. */
+  readonly #specs = new Map<bigint, MenuItemSpec>();
+  readonly #submenus: Menu[] = [];
 
   constructor(title = "") {
     this.native = objc.NSMenu.alloc().initWithTitle_(title);
@@ -109,6 +112,7 @@ export class Menu {
 
     if (spec.submenu) {
       const sub = Menu.from(spec.submenu, spec.title);
+      this.#submenus.push(sub);
       item.setSubmenu_(sub.native);
       if (spec.role === "services") objc.NSApplication.sharedApplication().setServicesMenu_(sub.native);
       if (spec.role === "windows") objc.NSApplication.sharedApplication().setWindowsMenu_(sub.native);
@@ -116,11 +120,25 @@ export class Menu {
     }
 
     this.native.addItem_(item);
+    this.#specs.set(item.ptr, spec);
     return item;
+  }
+
+  /** The spec an item of this menu, or of one of its submenus, was made from. */
+  specFor(item: any): MenuItemSpec | undefined {
+    if (!item || item.ptr === undefined) return undefined;
+    const own = this.#specs.get(item.ptr);
+    if (own) return own;
+    for (const sub of this.#submenus) {
+      const found = sub.specFor(item);
+      if (found) return found;
+    }
+    return undefined;
   }
 
   addSubmenu(title: string, items: MenuItemSpec[]): Menu {
     const sub = Menu.from(items, title);
+    this.#submenus.push(sub);
     const item = objc.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, null, "");
     item.setSubmenu_(sub.native);
     this.native.addItem_(item);
@@ -248,9 +266,51 @@ export function standardMenu(options: StandardMenuOptions = {}): Menu {
   return bar;
 }
 
-/** Show a context menu at the current mouse position. */
-export function popUpMenu(items: MenuItemSpec[], view?: any): void {
-  const m = Menu.from(items);
-  const event = objc.NSApplication.sharedApplication().currentEvent();
-  objc.NSMenu.popUpContextMenu_withEvent_forView_(m.native, event, view ?? null);
+// Mouse events: down, up and dragged for each button, moved, entered and exited.
+const MOUSE_EVENTS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 25, 26, 27]);
+
+/**
+ * Show a context menu at the mouse, and resolve with the item chosen — the spec it was made from
+ * — or `undefined` when it was dismissed.
+ *
+ *   const chosen = await popUpMenu([{ title: "Rename" }, { title: "Delete" }], view);
+ *
+ * Asynchronous since v2. A menu runs a loop of its own until it closes; opened from your call,
+ * that loop would run with your function suspended mid-statement and BunKit's main loop stopped.
+ * It is opened from the pump instead (`sendFromPump`), with nothing of yours on the stack, so
+ * main-loop timers, frames and messages from threads keep running while it is open
+ * (docs/main-loop/spec.md §6). The chosen item's `onClick` runs before the promise resolves.
+ *
+ * Pass a {@link Menu} instead of specs to keep hold of it: `menu.native.cancelTracking()` closes it.
+ */
+export async function popUpMenu(items: MenuItemSpec[] | Menu, view?: any): Promise<MenuItemSpec | undefined> {
+  const m = items instanceof Menu ? items : Menu.from(items);
+  const app = objc.NSApplication.sharedApplication();
+  // Captured now: by the time the pump opens the menu, the event in hand is another one.
+  const event = app.currentEvent();
+  const native = view ? (view.native ?? view) : null;
+  let chosen: MenuItemSpec | undefined;
+  const center = objc.NSNotificationCenter.defaultCenter();
+  // Posted when a menu item's action is sent: whichever item it was, onClick or responder chain.
+  const sent = createBlock("v@?@", (note: any) => {
+    const item = note.userInfo()?.objectForKey_("MenuItem");
+    const spec = m.specFor(item);
+    if (spec) chosen = spec;
+  });
+  const observer = center.addObserverForName_object_queue_usingBlock_(
+    globalObject("NSMenuDidSendActionNotification"), null, null, sent,
+  );
+  try {
+    if (native && event && MOUSE_EVENTS.has(Number(event.type()))) {
+      await sendFromPump(objc.NSMenu, "popUpContextMenu:withEvent:forView:", m.native, event, native);
+    } else {
+      // No mouse event to place it by (called from a timer, say): at the mouse, on screen.
+      const at = objc.NSEvent.mouseLocation();
+      await sendFromPump(m.native, "popUpMenuPositioningItem:atLocation:inView:", null, at, null);
+    }
+  } finally {
+    center.removeObserver_(observer);
+    sent.dispose();
+  }
+  return chosen;
 }
