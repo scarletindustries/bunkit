@@ -4,6 +4,22 @@
 JS→native callback dispatcher in `src/objc.ts`, frame delivery (`onFrame`, `GPUView`),
 `src/ui/menu.ts`, `src/ui/dialogs.ts`, `src/net`, and a new `bunkit/thread`.
 
+## Building it
+
+- **On a branch of its own.** Create `main-loop` from `hiettlight/v2` and do all the work there.
+  Never commit to or push `hiettlight/v2` directly: hiettlight's `v2` tracks that branch, and it
+  stays as it is until this is finished. Push `main-loop` as often as you like.
+- **Merged once, when it is done:** every section built, section 13's open questions answered and
+  written back into this document, and the tests in section 11 passing. Merge `main-loop` into
+  `hiettlight/v2` then, and not before.
+- **This repo's rules apply** (`CLAUDE.md`): rebuild the dylib after any change under `native/`
+  (`./native/build.sh`); `bun run typecheck` at 0 errors and `bun test` green before every push;
+  commits of 12 words or fewer, all lowercase, no body, and no tool attribution or co-author lines.
+- **Start with section 13.** Run the experiments in `docs/main-loop/experiments/`, then settle open
+  questions 2 (the checkpoint) and 1 (display links) before building anything that depends on
+  them. Where a measurement contradicts this spec, the measurement wins: change the spec in the
+  same commit.
+
 ## Summary
 
 AppKit sometimes takes the main thread and keeps it until a person lets go of the mouse: an open
