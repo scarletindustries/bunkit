@@ -114,7 +114,8 @@ On an M-series Mac, macOS 26, Bun 1.4.4. The scripts are in `docs/main-loop/expe
 | **E2** · a real `NSMenu`, popped up from JavaScript | mode `NSEventTrackingRunLoopMode`; **23–24 calls** of a 10 ms common-modes timer in the ~330 ms it was open (≈33 expected); Bun `setInterval` **0** |
 | **E3** · a worker posting a native function to GCD's main queue every 10 ms, during a nested second | posted 85–92, **delivered 110–119** (posts queued before the loop as well), **all on the main thread** |
 | **E4** · `Atomics.waitAsync` in Bun | works: a 20 ms `Atomics.notify` woke it at 21 ms |
-| **E5** · `-[NSView displayLinkWithTarget:selector:]` and `-[NSScreen displayLink…]` in the common modes, from a bare process | **no callbacks in any mode**, window visible: unexplained, open question 1 (§13) |
+| **E5** · `-[NSView displayLinkWithTarget:selector:]` and `-[NSScreen displayLink…]` in the common modes, from a bare process | with the modes named by strings made at runtime: **no callbacks in any mode**. With the frameworks' own constants: **120 a second in the default mode and 121 in tracking**, on a 120 Hz panel (open question 1, §13) |
+| **E6** · the microtask checkpoint, from a common-modes timer inside a nested loop | `process._tickCallback()` runs **nothing**; `drainMicrotasks()` runs both queues but **promise reactions before nextTicks**; the callback queued as a nextTick, then `drainMicrotasks()`: **Bun's own order** (open question 2, §13) |
 
 Surveyed: Bun exposes nothing that steps or wakes its event loop. It has `Bun.sleep`,
 `Bun.sleepSync`, and `bun:jsc`'s `drainMicrotasks`. `process._tickCallback` exists, and
@@ -241,9 +242,13 @@ turn():
   inTurn = false
 ```
 
-- **Checkpoint after every callback**, as the HTML event loop does after every task. The candidates
-  are `process._tickCallback()` (nextTick, then microtasks) and `drainMicrotasks()`. Which one
-  covers both queues in Bun's order is open question 2.
+- **Checkpoint after every callback**, as the HTML event loop does after every task. Measured (E6,
+  open question 2): the callback is queued with `process.nextTick` and the turn calls
+  `drainMicrotasks()` (`bun:jsc`). With the microtask queue empty, that drain hands the tick queue
+  to Bun's own tick runner, which runs the callback, then its nextTicks, then the microtasks, and
+  round again, exactly as Bun does after one of its own tasks. Neither candidate this spec named
+  does: `process._tickCallback()` runs nothing on Bun 1.4.4, and `drainMicrotasks()` after a plain
+  call runs promise reactions before nextTicks.
 - **A budget per turn** (default 8 ms) stops a flood of work from starving AppKit's own event
   handling inside a menu. The remainder runs in the next turn, signalled before yielding.
 - **Exceptions** in a callback are caught, reported with their stack, and never unwind into
@@ -296,8 +301,9 @@ at 60, and on a ProMotion panel at up to 120.
 
 - **Clock source, in order of preference:**
   1. `-[NSView displayLinkWithTarget:selector:]` (macOS 14+), added to the common modes. E5 saw no
-     callbacks from a bare process in any mode, so it is not relied on until open question 1 is
-     answered.
+     callbacks only because it named the modes with strings made at runtime; with
+     `NSRunLoopCommonModes` itself, a link fires at the display's rate in every common mode (open
+     question 1).
   2. A common-modes `CFRunLoopTimer` at the screen's refresh interval
      (`NSScreen.maximumFramesPerSecond`), with `CAMetalLayer`'s own vsync pacing deciding when a
      drawable is shown. This fires inside tracking (E1, E2).
@@ -522,11 +528,27 @@ All in BunKit's suite, one process per suite as now:
 
 ## 13. Open questions (answer before building on them)
 
-1. **Display links (E5).** Why no callbacks came from `NSView` or `NSScreen` display links in a
-   bare process, in any mode. Until answered, frames use the run-loop timer (§5, option 2).
-2. **The checkpoint in Bun.** Whether `process._tickCallback()` drains the nextTick queue and then
-   microtasks in Bun's order, or whether `drainMicrotasks()` must follow it. Settle it with test 3
-   first.
+1. **Display links (E5). Answered: the modes, not the links.** The experiment named its modes with
+   strings made at runtime, and both were wrong in a way that has nothing to do with display links:
+   - the default mode's name is `kCFRunLoopDefaultMode`. `"NSDefaultRunLoopMode"` names an empty mode
+     of its own, so running it ran nothing at all;
+   - `CFRunLoopAddSource` and friends recognise the common modes **by pointer**
+     (`modeName == kCFRunLoopCommonModes`). An equal string made at runtime is taken as an ordinary
+     mode called `"kCFRunLoopCommonModes"`, which nothing ever runs. `-[NSRunLoop addTimer:forMode:]`
+     compares by value, which is why E1's `NSTimer` fired.
+
+   With the constants (`globalObject("NSRunLoopCommonModes")` from JavaScript, the symbols in native
+   code), `NSView` and `NSScreen` display links fire 120 times a second on a 120 Hz panel in the
+   default mode and in `NSEventTrackingRunLoopMode`, from Bun, with a JavaScript target. Frames use
+   display links (§5, option 1). Everything BunKit adds to the run loop is added from native code,
+   with the symbols.
+2. **The checkpoint in Bun. Answered (E6): neither candidate; the callback as a nextTick, then
+   `drainMicrotasks()`.** `process._tickCallback()` exists on Bun 1.4.4 and runs nothing.
+   `drainMicrotasks()` drains both queues to empty, but after a plain call it runs the microtask
+   queue first and the nextTick queue after it, the reverse of Bun's order. Queued with
+   `process.nextTick` instead, the callback is run by Bun's own tick runner, which then runs its
+   nextTicks, then the microtasks, and repeats until both are empty: the same order, entry for
+   entry, as after a Bun timer. A turn checkpoints that way after every callback (§4.2).
 3. **Calling into JavaScript from a run-loop source during a modal session and during live resize.**
    AppKit holds no lock JavaScript could re-enter, but this is to be verified per mode by test 1.
 4. **`bun:ffi` and `JSCallback` in threads under load.** Lifetimes across threads, termination with
@@ -546,7 +568,8 @@ In `docs/main-loop/experiments/`, run with `bun <file>` from that folder:
 | `nested.ts` (+ `worker.ts`) | E1: a second in `NSEventTrackingRunLoopMode` entered from JavaScript. Common-modes timer calls, Bun timers and timeouts, promise continuations, a worker. `bun nested.ts drain` repeats it with `drainMicrotasks()`. |
 | `menu.ts` | E2: a real `NSMenu`, its mode, and what runs while it's open (it pops up on screen for a moment). |
 | `deliver.ts` (+ `poster.ts`) | E3: a worker putting a main-thread function on GCD's main queue during a nested second. |
-| `displaylink.ts` | E5: display-link callbacks in the default and tracking modes (none, so far). |
+| `displaylink.ts` | E5: display-link callbacks in the default and tracking modes, with the modes named by strings (none) and by the frameworks' constants (the display's rate). |
+| `checkpoint.ts` | E6: nextTicks, promise reactions and `queueMicrotask` queued from a common-modes timer inside a nested loop, under each candidate checkpoint, against Bun's own order. |
 
 E4 is one line:
 `const a = new Int32Array(new SharedArrayBuffer(4)); Atomics.waitAsync(a, 0, 0, 1000).value.then(…); setTimeout(() => Atomics.notify(a, 0), 20)`.
