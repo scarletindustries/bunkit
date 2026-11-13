@@ -581,7 +581,10 @@ because hosting fixes nesting, not a busy UI thread.
 
 All in BunKit's suite, one process per suite as now: tests 1, 2, 3 and 6 in `test/mainloop.ts`,
 4 and 5 in `test/thread.ts`, 7 in `test/soak.ts`, 8 in `test/perf.ts`. All pass; the numbers they
-measured are in the sections above.
+measured are in the sections above. Test 7 also ran for an hour (`SOAK_SECONDS=3600`): 191,366
+rounds — 2.7 million main-loop timers, 9.6 million tasks, 593,000 frames, 191,000 trampolined
+calls, 1.5 million thread messages, 3,828 threads started and ended — with nothing left held and
+memory flat over its second half.
 
 1. **Nesting from event dispatch.** For each of: a context menu popped up through the trampoline
    (`popUpMenu`, cancelled from a main-loop timer), a synthesized live resize, a synthesized slider
@@ -656,7 +659,20 @@ measured are in the sections above.
    inside its own callout during the resize stopped firing in the default mode afterwards (§4.1).
 4. **`bun:ffi` and `JSCallback` in threads under load.** Lifetimes across threads, termination with
    calls in flight, and an hour's soak. A library's own thread-safety (hiettlight's Rust runtime,
-   for one) is that library's question. **Answered: see `experiments/threads-ffi.ts`** — RESULT.
+   for one) is that library's question. **Answered: they hold up. The one leak found was Bun's, and
+   BunKit no longer reaches it.** Measured over an hour (`experiments/threads-ffi.ts`): 116,030
+   threads, four at a time, each calling into native code that calls back into it (libc's `qsort`
+   with a JavaScript comparator), signalling the main loop through `bun:ffi`, making and closing
+   JSCallbacks and sending to the main thread, and each ended 5–200 ms in with calls in flight
+   (116,026 of them). No crash, no error, 927,000 messages delivered, main-loop timers at 89 a second
+   throughout under that load, and the main thread's memory flat at 31–35 MB.
+   - The first hour's run grew 35 → 274 MB. Controls traced it to growable `SharedArrayBuffer`s
+     shared with a worker (§7.2), not to `bun:ffi` or `JSCallback`: plain workers ended mid-call the
+     same way, with and without FFI, stayed flat at 22–24 MB. The arenas are plain buffers now.
+   - A `JSCallback` belongs to the thread that made it and ends with it. One handed to native code
+     must not be called after its thread has ended, which is the library's contract, as above.
+   - The experiment's first comparator read its arguments as offsets into the array, and failed
+     once in 124,728 threads: `qsort` may pass a copy of an element. Read through the pointers.
 5. **`callbackDepth` coverage. Answered: every entry counts.** It is counted in native code, around
    the call, not in JavaScript:
    - `dispatchCallback` — every delegate, action, data source and subclass method — and every
