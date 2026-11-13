@@ -337,12 +337,21 @@ export class GPUView extends View {
     return lib.br_drawables_ready(pump) !== 0;
   }
 
-  /** The drawable thread, started on first use once the view is in a window. */
+  /**
+   * The drawable thread, started on first use once the view is in a window.
+   *
+   * The layer is sized first. A CAMetalLayer whose drawableSize was never set is 0×0 and
+   * hands out no drawables, and only a draw sizes it — so a thread started before the
+   * first draw left `frameDue` false for good, and a caller that draws only when it is
+   * true never drew. That was a view asked before it was laid out: a frame callback that
+   * runs before AppKit's layout pass, as display-clock frames can.
+   */
   #drawables(): bigint | null {
     if (this.#pump !== null) return this.#pump;
     if (this.#noPump) return null;
     const window = this.native.window();
     if (!window || window.ptr === NIL) return null;
+    this.#syncSize();
     const pump = lib.br_drawables_create(this.layer.ptr) as bigint;
     if (!pump || pump === NIL) {
       this.#noPump = true;

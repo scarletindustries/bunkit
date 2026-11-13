@@ -348,6 +348,31 @@ if (!gpuAvailable()) {
     s.dispose();
     win.close();
   }
+
+  // Asked before it is laid out: a frame callback on the display's clock can run before
+  // AppKit's layout pass, so the first `frameDue` can come while the view is in a window at
+  // 0×0. The drawable thread started then, on a layer nothing had sized, got no drawable ever,
+  // and a caller that draws only when a frame is due never drew.
+  {
+    const s = new Scene3D({ animate: false });
+    s.add(box({ color: "#aa091b" }));
+    const win = new Window({ title: "metal", size: { width: 320, height: 240 }, content: new VStack({}, []), show: true });
+    win.native.contentView().addSubview_(s.native);
+    s.native.setFrame_({ origin: { x: 0, y: 0 }, size: { width: 0, height: 0 } });
+    s.frameDue; // starts the drawable thread, at no size
+    s.native.setFrame_({ origin: { x: 0, y: 0 }, size: { width: 200, height: 150 } });
+    let drawn = 0;
+    for (let i = 0; i < 100 && drawn === 0; i++) {
+      pumpOnce(0.004);
+      if (s.frameDue) {
+        s.draw();
+        drawn++;
+      }
+    }
+    check("a view first asked for a frame at no size draws once it has one", drawn > 0, drawn);
+    s.dispose();
+    win.close();
+  }
 }
 
 // ---------------------------------------------------------------------------
