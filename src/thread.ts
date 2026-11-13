@@ -823,6 +823,11 @@ function mainSide(): typeof import("./mainloop.ts") {
         let ran = false;
         for (const t of [...threads]) {
           ran = t.channel.drain(deadline, main.runInTurn) || ran;
+          // Ended by itself, and everything it sent before it went has been delivered.
+          if (t.exited && !t.channel.pending) {
+            threads.delete(t);
+            continue;
+          }
           if (performance.now() >= deadline) {
             // More may be waiting: the next turn takes it.
             if (t.channel.pending) main.requestTurn();

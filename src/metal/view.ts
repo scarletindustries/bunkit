@@ -409,7 +409,9 @@ export class GPUView extends View {
     return this.#inFlight.length;
   }
 
-  #tick(now: number): void {
+  #tick(when: number): void {
+    // Frames from the display and frames run by hand (pumpOnce) interleave; time never goes back.
+    const now = Math.max(when, this.#last);
     if (this.#start === 0) {
       this.#start = now;
       this.#last = now;

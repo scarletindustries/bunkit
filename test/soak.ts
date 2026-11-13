@@ -114,6 +114,8 @@ while ((performance.now() - t0) / 1000 < SECONDS) {
     const t = MainLoop.after(i % 3, () => void timersRun++);
     if (i % 2) t.dispose();
   }
+  // Long ones, cancelled long before they are due: a debounce.
+  for (let i = 0; i < 20; i++) MainLoop.after(60_000, () => void timersRun++).dispose();
   const every = MainLoop.every(1, () => void timersRun++);
   for (let i = 0; i < 50; i++) MainLoop.post(() => void tasksRun++);
   const stopFrames = onFrame(() => void framesSeen++);

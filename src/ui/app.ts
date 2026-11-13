@@ -3,13 +3,18 @@
 import { objc } from "../objc.ts";
 import {
   ActivationPolicy,
+  counted,
   initApp,
   isRunning,
+  MainLoop,
+  onFrame,
   onQuit,
   pumpOnce,
   quit,
   run,
+  type FrameInfo,
   type RunOptions,
+  type Stall,
 } from "../runtime.ts";
 import { Menu, standardMenu, type StandardMenuOptions } from "./menu.ts";
 import { Window, allWindows } from "./window.ts";
@@ -115,4 +120,5 @@ export class Application {
   }
 }
 
-export { quit, run, initApp, pumpOnce, onQuit };
+export { quit, run, initApp, pumpOnce, onQuit, MainLoop, onFrame, counted };
+export type { FrameInfo, Stall };

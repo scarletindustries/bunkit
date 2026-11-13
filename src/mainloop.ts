@@ -269,10 +269,31 @@ function heapPop(): Timer | undefined {
   return top;
 }
 
+/** Timers disposed but still in the heap, waiting to reach its top. */
+let cancelled = 0;
+
 /** Drop cancelled timers off the top, so heap[0] is the next live one. */
 function heapTop(): Timer | undefined {
-  while (heap.length > 0 && !heap[0]!.live) heapPop();
+  while (heap.length > 0 && !heap[0]!.live) {
+    heapPop();
+    cancelled = Math.max(0, cancelled - 1);
+  }
   return heap[0];
+}
+
+/**
+ * Rebuild the heap from its live timers, once most of it is disposed ones: a long timer that is
+ * cancelled — a debounce — would otherwise keep its place, and its closure, until it came due.
+ */
+function cancel(t: Timer): void {
+  if (!t.live) return;
+  t.live = false;
+  if (++cancelled > 64 && cancelled * 2 > heap.length) {
+    const live = heap.filter((x) => x.live);
+    heap.length = 0;
+    for (const x of live) heapPush(x);
+    cancelled = 0;
+  }
 }
 
 let tasks: Array<() => void> = [];
@@ -329,9 +350,7 @@ function addTimer(ms: number, fn: () => void, period: number, tolerance: number)
   };
   heapPush(t);
   if (t.due + t.tolerance < armedFor) arm(t.due + t.tolerance);
-  const stop = () => {
-    t.live = false;
-  };
+  const stop = () => cancel(t);
   return { dispose: stop, [Symbol.dispose]: stop };
 }
 
@@ -717,7 +736,16 @@ export function frameTick(): number {
  */
 export function tickFrames(): void {
   const now = lib.br_now() as number;
-  const frame: FrameInfo = { timestamp: now, targetTimestamp: now + 1 / 60, duration: 1 / 60 };
+  // The interval of a running clock if there is one: a frame of its own, shown at the next refresh.
+  let duration = 1 / 60;
+  for (const clock of clocks.values()) {
+    const d = CF[cf(clock.slot, 2)]!;
+    if (d > 0) {
+      duration = d;
+      break;
+    }
+  }
+  const frame: FrameInfo = { timestamp: now, targetTimestamp: now + duration, duration };
   for (const s of [...subscribers]) {
     if (!s.clock) attach(s);
     s.delivered++;

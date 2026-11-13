@@ -1,8 +1,10 @@
 # BunKit v2: the main loop
 
-**Status:** proposed, for BunKit v2. **Scope:** `src/runtime.ts`, `native/src/runloop.m`, the
-JS→native callback dispatcher in `src/objc.ts`, frame delivery (`onFrame`, `GPUView`),
-`src/ui/menu.ts`, `src/ui/dialogs.ts`, `src/net`, and a new `bunkit/thread`.
+**Status:** built, for BunKit v2. **Scope:** `src/runtime.ts` and a new `src/mainloop.ts`,
+`native/src/runloop.m` and a new `native/src/mainloop.m`, the native → JavaScript trampoline in
+`native/src/closures.m`, frame delivery (`onFrame`, `GPUView`), `src/ui/menu.ts`, `src/net`, and a
+new `bunkit/thread` (`src/thread.ts`). Where building it measured something this document had
+assumed, the measurement is written in, marked *measured*.
 
 ## Building it
 
@@ -86,11 +88,11 @@ Some AppKit interactions run a run loop of their own and return only when the in
 | A menu-bar menu | `-sendEvent:` (mouse down in the menu bar) | `NSEventTrackingRunLoopMode` (measured, E2 shape) |
 | A context menu (`+popUpContextMenu:withEvent:forView:`) | the caller: BunKit's `popUpMenu` | `NSEventTrackingRunLoopMode` (E2) |
 | Live window resize | `-sendEvent:` | `NSEventTrackingRunLoopMode` |
-| Control tracking: `NSSlider`, steppers, scrollers, segmented controls | `-sendEvent:` → the cell's `-trackMouse:…` | `NSEventTrackingRunLoopMode` |
-| A modal session (`-runModal…`) | the caller | `NSModalPanelRunLoopMode` |
+| Control tracking: `NSSlider`, steppers, scrollers, segmented controls | `-sendEvent:` → the cell's `-trackMouse:…` | `NSEventTrackingRunLoopMode` per Apple's documentation; **measured on macOS 26, a slider drag runs no nested loop at all**: its drags arrive as ordinary events (§11, test 1) |
+| A modal session (`-runModal…`) | the caller | `NSModalPanelRunLoopMode` (measured, §11 test 1) |
 
-Both modes are members of the common modes (`kCFRunLoopCommonModes`). Rows not marked measured
-are from Apple's documentation, and each gets a test in §11.
+Live resize measured in `NSEventTrackingRunLoopMode` too (§11, test 1). Both modes are members of
+the common modes (`kCFRunLoopCommonModes`).
 
 What matters is not the mode but **what is on the JavaScript stack when the nesting starts**:
 
@@ -212,21 +214,40 @@ show night. It is rejected (§10).
 On the main run loop, all in `kCFRunLoopCommonModes`:
 
 - **the work source**: one version-0 `CFRunLoopSource`, signalled whenever there is work: a posted
-  task, a channel message (§7), a frame (§5);
-- **the deadline timer**: one `CFRunLoopTimer`, re-armed to the earliest due main-loop timer;
+  task, a channel message (§7), a finished trampolined call (§6.1), events from `net.m` (§7.5);
+- **the deadline timer**: a one-shot `CFRunLoopTimer` for the earliest due main-loop timer, made
+  anew for each deadline. *Measured:* one long-lived timer moved with
+  `CFRunLoopTimerSetNextFireDate` from inside its own callout (where the turn it fires runs) is
+  re-armed only in the mode that callout ran in. Fired inside a live resize's tracking loop and
+  moved there, it never fired again in the default mode: its date sat in the past and nothing of
+  the main loop ran for 4 s, until some other timer re-armed that mode. A timer added to the run
+  loop is armed in every mode it is in;
 - **the frame clocks** (§5).
+
+All of it is added from native code, with the frameworks' symbols for the modes (§13, open
+question 1).
 
 When the source or the timer fires:
 
 1. **At a safe point:** call the single JavaScript entry, `turn()`, which is a `JSCallback` that
    counts in `callbackDepth`.
 2. **Not at a safe point:** set `pendingTurn` and return. `br_pump` runs a pending turn at its next
-   safe point: after each `-sendEvent:` returns and before it returns to JavaScript.
+   safe point: as it starts, after each `-sendEvent:` returns, and before it returns to JavaScript.
 
 `br_main_signal()` is `CFRunLoopSourceSignal` followed by `CFRunLoopWakeUp`. Both are documented
 thread-safe, and the signal is callable from any thread: workers (§7), native subsystems
 (`net.m`), and JavaScript on the main thread (`MainLoop.post`). Signals coalesce: one turn drains
 everything pending.
+
+`run()` still waits in Bun while the app is idle (§4.4), and a pump that is not running cannot be
+woken by the run loop. So a signal also ends that wait, through a `threadsafe` bun:ffi callback
+called only while `run()` has said it is idle-waiting (a word both sides read, checked against a
+`signalled` word in the order that loses no wake-up), and the wait never runs past the main loop's
+next deadline.
+
+The state both sides read is one native static, `br_main_state`: `callbackDepth`, `inPump`,
+`inTurn`, `pendingTurn`, the bits of native work pending for a turn, the next deadline. JavaScript
+views it as a `Uint32Array` and a `Float64Array`, so reading and keeping it costs no FFI call.
 
 ### 4.2 A turn (`src/runtime.ts`)
 
@@ -237,7 +258,7 @@ turn():
     run each due timer (earliest deadline first), then each posted task (FIFO),
       then drain each channel (§7.2) and run due frames (§5);
     after every callback: checkpoint — the nextTick queue, then microtasks
-  re-arm the deadline timer (CFRunLoopTimerSetNextFireDate) — one FFI call
+  write the next deadline into the shared state; the native side arms it when turn() returns
   if work remains: br_main_signal()      // yield to AppKit, come straight back
   inTurn = false
 ```
@@ -253,6 +274,10 @@ turn():
   handling inside a menu. The remainder runs in the next turn, signalled before yielding.
 - **Exceptions** in a callback are caught, reported with their stack, and never unwind into
   Objective-C, as `dispatchCallback` already guarantees.
+- **Cost** (measured, M2 Pro, `test/perf.ts`): a turn's fixed cost — the source firing inside the
+  pump, the call into JavaScript and back, the checks for work — is 0.25–0.3 µs, and a task with
+  its checkpoint 0.15 µs. Native reports (nested loops, stalls) are taken before completions, so
+  they are heard before the call they came from resolves.
 
 ### 4.3 API (`bunkit/runtime`)
 
@@ -269,9 +294,15 @@ export const MainLoop: {
   /** Resolve at the next frame of `view` (or of the main screen). */
   nextFrame(view?: View): Promise<FrameInfo>;
   readonly stats: MainLoopStats;                       // §8
+  resetStats(): void;
   onStall(fn: (stall: Stall) => void, options?: { thresholdMs?: number }): Disposable;
 };
+/** Wrap the body of a JSCallback of your own, so a call into it counts in callbackDepth (§13.5). */
+export function counted<F extends (...args: any[]) => any>(fn: F): F;
 ```
+
+`run()` takes `turnBudgetMs` (default 8). The main loop needs the app's loop to run: `run()`, or
+`pumpOnce` from a script that drives the app by hand.
 
 - **Deliberately not `setTimeout`.** These run inside nested loops and Bun's timers don't; one name
   for two behaviours is how an app ends up with half its timers frozen. Globals are never patched
@@ -285,7 +316,12 @@ export const MainLoop: {
 
 On today's Bun, Bun stays outermost and runs between pump slices exactly as in v1. Main-loop
 turns run inside pump slices, nested or not. While Bun is running JavaScript, a due main-loop
-timer waits for the next slice, which is at most `pumpSeconds` (4 ms) away while active.
+timer waits for the next slice, which is at most `pumpSeconds` (4 ms) away while active; while
+idle, `run()`'s wait in Bun ends at the next main-loop deadline, or at once when anything signals.
+
+`pumpOnce` is a safe point too. A script that drives the app by hand chooses where the loop runs
+by calling it, as v1's frames and AppKit's callbacks already ran inside it; turns run there, and
+not while the script's own code runs.
 
 **No ordering is guaranteed between a Bun task and a main-loop task.** They are two queues. An
 ordered stream uses one of them; the channel (§7.2) is the one that survives nesting.
@@ -299,22 +335,30 @@ display's clock**, and are delivered as main-loop turns. Views keep drawing thro
 menus and slider drags, each paced by its own screen: a window on a 60 Hz external display draws
 at 60, and on a ProMotion panel at up to 120.
 
-- **Clock source, in order of preference:**
-  1. `-[NSView displayLinkWithTarget:selector:]` (macOS 14+), added to the common modes. E5 saw no
-     callbacks only because it named the modes with strings made at runtime; with
-     `NSRunLoopCommonModes` itself, a link fires at the display's rate in every common mode (open
-     question 1).
-  2. A common-modes `CFRunLoopTimer` at the screen's refresh interval
-     (`NSScreen.maximumFramesPerSecond`), with `CAMetalLayer`'s own vsync pacing deciding when a
-     drawable is shown. This fires inside tracking (E1, E2).
-  3. `CVDisplayLink` (deprecated) on its own thread, signalling the work source.
-- **Live resize:** from `-viewWillStartLiveResize` to `-viewDidEndLiveResize`, a Metal view sets
-  `presentsWithTransaction = YES` and draws in the turn that follows each size change, so the
-  drawable matches the window. No stretched frames.
-- **Idle:** the clock runs only while something animates. The `setAnimating` refcount is kept, so
-  an idle app has no wakeups.
-- `onFrame(fn)` keeps its signature, and the callback gets
-  `{ timestamp, targetTimestamp, duration }`.
+- **Clock source, as built:**
+  1. A display link (macOS 14+), added to the common modes with `NSRunLoopCommonModes` itself. E5
+     saw no callbacks only because it named the modes with strings made at runtime (open question
+     1). **One per screen, `-[NSScreen displayLinkWithTarget:selector:]`, not one per view:** every
+     frame callback of a screen then runs in one turn, so `frameTick` advances once a frame and an
+     input edge is seen by every view of that frame. A view's subscription is on the clock of the
+     screen its window is on, and moves when the window changes screen or the screens change.
+     Measured: 120.0 frames a second on a 120 Hz panel, in the default mode and inside tracking.
+  2. Before macOS 14, a common-modes `CFRunLoopTimer` at the screen's refresh interval
+     (`NSScreen.maximumFramesPerSecond`), made anew whenever it starts (§4.1).
+  3. `CVDisplayLink` is not used.
+- **Live resize:** from `NSWindowWillStartLiveResizeNotification` to `…DidEnd…`, a `GPUView` sets
+  `presentsWithTransaction = YES`, presents with `commit`, `waitUntilScheduled`, `present`, and
+  draws in the turn that follows each size change (`NSViewFrameDidChangeNotification`). Measured
+  over a synthesized resize: 64 frames for 28 size changes, none the wrong size for the window
+  (`stats.liveResize.mismatched`, §11 test 6).
+- **Idle:** a clock runs only while something is subscribed to it, so an idle app has no frame
+  wakeups (measured: none, and no turns at all, §11 test 6). The `setAnimating` refcount is kept,
+  and a running clock also counts as animating, so `run()` stays at its active cadence and frames
+  never wait out an idle sleep.
+- `onFrame(fn)` keeps its signature (it returns the function that stops it), and the callback gets
+  `{ timestamp, targetTimestamp, duration }` instead of v1's bare number. `pumpOnce` still runs a
+  frame each call: when the display's clock brought none during its pump, it runs every
+  subscriber once itself.
 
 ---
 
@@ -330,21 +374,35 @@ running. The promise resolves in the turn after the AppKit call returns.
 
 | v1 | v2 |
 | --- | --- |
-| `popUpMenu(items, view)` calls `+popUpContextMenu:withEvent:forView:` synchronously | `popUpMenu(items, view): Promise<MenuItem \| undefined>` |
+| `popUpMenu(items, view)` calls `+popUpContextMenu:withEvent:forView:` synchronously | `popUpMenu(items \| menu, view?): Promise<MenuItemSpec \| undefined>`: the spec of the item chosen, after its `onClick` ran |
 | `alert`/`prompt` fall back to `-runModal` with no window on screen | always hung from a host window as a sheet; `-runModal` is unreachable from BunKit |
 | (future) any `-runModal…`, `-popUpMenuPositioningItem:…`, `NSSavePanel -runModal`, `NSPrintOperation -runOperation` | asynchronous and trampolined when wrapped |
 
+The trampoline is `sendFromPump(target, selector, ...args): Promise<result>` in `bunkit/objc`.
+The arguments are marshalled at once and every object among them retained; `br_pump` makes the
+call from its own body — not from a run-loop callout, where a source re-entered by its own nested
+loop would be a hazard — after posting itself a wake-up so a pump asleep in AppKit comes round at
+once. The result, retained, resolves the promise in the next turn. Measured: a context menu opened
+this way and cancelled from a main-loop timer ran main-loop timers at 96% of nominal while open,
+frames at the display's rate, and a thread's messages in order (§11, test 1).
+
 ### 6.2 Detection
 
-A `CFRunLoopObserver` for `kCFRunLoopEntry | kCFRunLoopExit`, in the common modes, keeps the
-nesting depth. A nested entry while the main thread is not at a safe point means your JavaScript
-started it, through BunKit's raw `objc` layer. BunKit then:
+A `CFRunLoopObserver` for `kCFRunLoopEntry | kCFRunLoopExit` keeps the nesting depth, in the modes
+AppKit's nested loops run in: `NSEventTrackingRunLoopMode` and `NSModalPanelRunLoopMode`. *Measured:*
+observed in the default mode as well, the two callouts each of the pump's own waits made cost
+every pump an eighth more than v1's (2.33 µs against 2.08); a loop JavaScript runs in the default
+mode is the one kind not reported. An entry while the main thread is not at a safe point means
+your JavaScript started it, through BunKit's raw `objc` layer. BunKit then:
 
-- records the mode, and the time until the matching exit;
-- in development builds, captures the JavaScript stack at entry. That is a side-effect-free
-  `new Error().stack` from the observer, the one JavaScript allowed to run off a safe point, and
-  only in development.
-- reports at the next safe point, once per call site:
+- records the mode, and the time from that entry to the last exit before the main thread next
+  reaches a safe point. *Measured:* one JavaScript call that runs the loop over and over
+  (`-runMode:beforeDate:` in a loop, which returns every few milliseconds) is many entries; held
+  open until the next safe point, it is one hold of the call's length, not one per run;
+- in development builds (running from source, or `BUNKIT_DEV=1`), captures the JavaScript stack at
+  the first entry. That is a side-effect-free `new Error().stack` from the observer, the one
+  JavaScript allowed to run off a safe point, and only in development.
+- reports at the next safe point, once per call site (the first frame that is not BunKit's own):
   `[bunkit] AppKit ran a nested run loop (NSModalPanelRunLoopMode) for 820 ms while JavaScript
   was on the stack, from …. The main loop waited. Use the asynchronous API instead.`
 
@@ -372,10 +430,13 @@ const safety = show.cell(SafetyLayout, "write");       // a shared cell, §7.4
 ```
 
 - **Compiled in.** The bundler's `workers` option already compiles worker entries into the
-  `.app`. `spawnThread` resolves the same URL from source and from the bundle.
-- **Lifecycle.** Threads are terminated on quit, after the quit handlers, against one deadline:
-  a stuck thread is abandoned, never waited for forever. An uncaught error in a thread reaches the
-  main thread through its channel, with its stack, and the thread is not restarted silently.
+  `.app`. `spawnThread` resolves the same URL from source and from the bundle. The channel's
+  memory reaches the thread in `workerData`, so it is there the moment the thread's code runs.
+- **Lifecycle.** Threads are terminated on quit, after the quit handlers, against one deadline
+  (1 s): each is asked to close (its `parent.onClose` handlers run), and one still running at the
+  deadline is terminated and abandoned, never waited for forever. An uncaught error or unhandled
+  rejection in a thread reaches the main thread through its channel, with its stack
+  (`thread.onError`; logged when nothing listens), and the thread exits and is not restarted.
 - **Native libraries.** `bun:ffi` in a thread opens the same dylibs into the same process. Whether
   a library may be called from two threads is the library's contract, and `bunkit/thread`
   documents it rather than assuming it (open question 4).
@@ -383,9 +444,10 @@ const safety = show.cell(SafetyLayout, "write");       // a shared cell, §7.4
 ### 7.2 Thread → main: the channel
 
 - **Transport:** one single-producer, single-consumer ring per thread, in a `SharedArrayBuffer`.
-  The producer writes a framed message (length, then bytes), publishes it with
+  The producer writes a framed message (length, tag, then bytes), publishes it with
   `Atomics.store(tail)`, and calls `br_main_signal()` through `bun:ffi`. It calls only when the
   consumer has armed an `idle` flag, so a busy stream costs one signal per turn, not per message.
+  Measured: 20,000 messages sent as fast as a thread could woke the main thread twice.
 - **Delivery:** the work source drains every ring in a turn, in order per ring, and dispatches to
   `onMessage`. It is delivered by the run loop, so **it arrives during menus, resizes and drags**.
   E3 shows the run loop carrying work from a thread to main-thread JavaScript inside a nested loop.
@@ -393,16 +455,26 @@ const safety = show.cell(SafetyLayout, "write");       // a shared cell, §7.4
   message, ordering is the ring's, and nothing interleaves with unrelated GCD work.
 - **Why not `postMessage`:** it is delivered by the main thread's Bun loop, which is stopped while
   AppKit nests.
-- **Encoding:** a compact binary codec (structured-clone-compatible values) with fast paths for
-  typed arrays. A large payload goes in a shared arena and is passed by handle.
-- **Backpressure** is chosen per channel: `drop-oldest` (telemetry), `fail` (the caller decides),
-  or `wait` (bounded `Atomics.wait`, off the main thread only).
+- **Encoding:** structured clone through `bun:jsc`'s native `serialize`, with fast paths that send
+  strings, `ArrayBuffer`s and every typed array as their bytes and give them back as what they
+  were. A payload over half the ring goes in the channel's arena — a second ring of bytes, a
+  growable `SharedArrayBuffer` that grows (only while empty) to fit the largest message — and the
+  ring carries its handle: 8 MiB messages through a 4 KiB ring, both ways, intact (§11, test 4).
+- **Backpressure** is chosen per channel: `drop-oldest` (telemetry), `fail` (the caller decides;
+  `send` returns false), or `wait` (bounded `Atomics.wait`, off the main thread only; on the main
+  thread it is `fail`). The consumer claims a message with a compare-and-swap of the head after
+  copying it, so one dropped from under it is discarded; a message in the arena is never dropped.
+- **Before anyone listens**, messages are kept and the first handler hears them: a thread's own
+  code registers its handler after BunKit's end of the channel has started reading.
 
 ### 7.3 Main → thread
 
 The same ring in the other direction. The thread waits with `Atomics.waitAsync` (E4), which keeps
-its own loop running. `postMessage` would also work, since the thread's loop is free, but one
-mechanism keeps ordering and backpressure the same both ways. The channel API hides which is used.
+its own loop running, and the main thread wakes it with `Atomics.notify`. *Measured:* a pending
+`waitAsync` does not keep a worker alive — one with nothing else to do exited within 10 ms — so a
+thread holds a timer while it has a message handler. `postMessage` would also work, since the
+thread's loop is free, but one mechanism keeps ordering and backpressure the same both ways. The
+channel API hides which is used.
 
 ### 7.4 Shared cells
 
@@ -413,13 +485,24 @@ needed at once: a playhead `{ frame, hostTime }`, safety switches, the latest st
 The latest value wins. There are no messages, and no latency beyond the reader's next read. The
 main thread reads it in a frame, and a thread reads it in its own clock.
 
+As built: `cellLayout(name, defaults)` describes it (numbers and booleans, each a 64-bit float);
+the main thread's `thread.cell(layout, mode)` makes the memory and posts it to the thread, whose
+`parent.cell(layout, mode)` attaches to it (reading the defaults, and keeping its writes, until it
+arrives). The reader validates with `Atomics.compareExchange`, not a load: a read-modify-write
+orders the field reads before it on arm64, which a plain acquire load does not. Measured: 4.1
+million reads of an eight-word cell during 3.7 million writes, none torn; the same reads without
+the seqlock tore about 3,000 times in a million.
+
 ### 7.5 `bunkit/net`
 
 v1 delivers messages through a `threadsafe` bun:ffi callback, so through the receiving thread's
-Bun loop, which on the main thread stalls during nesting. In v2, `net.m` writes received messages
-into a native ring and signals the work source, the same mechanism as §7.2. A peer's messages are
-delivered on the main thread during a menu. Used from a thread, its deliveries run on that
-thread's loop as before.
+Bun loop, which on the main thread stalls during nesting. In v2, `net.m` keeps its event list and
+also signals the work source, the same mechanism as §7.2; the turn takes the events. A peer's
+messages are delivered on the main thread during a menu (measured: 34 in the half second one was
+open, in order, §11 test 1), and a small message's round trip inside `run()` is 0.12 ms median
+(v1: 0.15). The `threadsafe` callback stays as well — whichever runs first drains — for a script
+that never pumps, and for net used from a thread, whose deliveries run on that thread's loop as
+before.
 
 ---
 
@@ -427,13 +510,19 @@ thread's loop as before.
 
 `MainLoop.stats`, which is native counters read on demand:
 
-- **nested loops:** count, total, longest, by mode, and how many started from your JavaScript (§6.2);
-- **Bun starvation:** the longest gap between two Bun turns on the main thread;
-- **main-loop lateness:** timers' p50, p99 and max lateness; turns' p99 and max duration;
-- **frames:** per view, delivered and missed.
+- **nested loops** (`nested`): count, total, longest, by mode, and how many started from your
+  JavaScript (§6.2). One from event dispatch is measured per `-sendEvent:` (or trampolined call):
+  one menu, one resize;
+- **Bun starvation** (`bun.longestWaitMs`): the longest single pump, which is the longest Bun went
+  without a turn on the main thread;
+- **main-loop lateness** (`timers`, `turns`): timers' p50, p99 and max lateness over the last
+  1024; turns' count, how many came due off a safe point, and their p50, p99 and max duration;
+- **frames** (`frames`): per clock (one per screen) fired and missed, and per subscriber delivered
+  and missed.
 
-`MainLoop.onStall(fn, { thresholdMs })` reports a stall when it ends: its duration, mode and
-origin. An app can show it, as hiettlight does with late lighting frames.
+`MainLoop.onStall(fn, { thresholdMs })` (default 50 ms) reports a stall when it ends: its duration,
+mode and origin — `"event"` (AppKit, from event dispatch), `"javascript"` (§6.2) or `"turn"` (a
+main-loop turn that ran long). An app can show it, as hiettlight does with late lighting frames.
 
 ---
 
@@ -485,7 +574,9 @@ because hosting fixes nesting, not a busy UI thread.
 
 ## 11. Testing
 
-All in BunKit's suite, one process per suite as now:
+All in BunKit's suite, one process per suite as now: tests 1, 2, 3 and 6 in `test/mainloop.ts`,
+4 and 5 in `test/thread.ts`, 7 in `test/soak.ts`, 8 in `test/perf.ts`. All pass; the numbers they
+measured are in the sections above.
 
 1. **Nesting from event dispatch.** For each of: a context menu popped up through the trampoline
    (`popUpMenu`, cancelled from a main-loop timer), a synthesized live resize, a synthesized slider
@@ -515,18 +606,20 @@ All in BunKit's suite, one process per suite as now:
 
 | v1 | v2 |
 | --- | --- |
-| `onFrame` once per pump iteration | on the display's clock, through live resize and menus |
-| `popUpMenu(…): void` | `popUpMenu(…): Promise<MenuItem \| undefined>` |
+| `onFrame` once per pump iteration, `(now: number) => void` | on the display's clock, through live resize and menus; `(frame: FrameInfo) => void` |
+| `GPUView` frames once per pump iteration | on the clock of the screen its window is on, presenting with the window's transaction during live resize |
+| `popUpMenu(…): void` | `popUpMenu(…): Promise<MenuItemSpec \| undefined>` |
 | dialogs' `-runModal` fallback | removed |
-| `bunkit/net` delivered by Bun's loop | delivered by the main loop |
+| `bunkit/net` delivered by Bun's loop | delivered by the main loop as well |
 | `setInterval` for UI refresh | `MainLoop.every`, which keeps running during menus |
-| — | `bunkit/thread`, `MainLoop`, `MainLoop.stats` |
+| — | `bunkit/thread`, `MainLoop`, `MainLoop.stats`, `sendFromPump`, `counted` |
 
 `run()`, `pumpOnce`, `setAnimating`, `onQuit` and the rest of the runtime keep their contracts.
+`pumpOnce` also runs main-loop turns (§4.4), and still runs a frame each call.
 
 ---
 
-## 13. Open questions (answer before building on them)
+## 13. Open questions (answered while building)
 
 1. **Display links (E5). Answered: the modes, not the links.** The experiment named its modes with
    strings made at runtime, and both were wrong in a way that has nothing to do with display links:
@@ -549,13 +642,31 @@ All in BunKit's suite, one process per suite as now:
    `process.nextTick` instead, the callback is run by Bun's own tick runner, which then runs its
    nextTicks, then the microtasks, and repeats until both are empty: the same order, entry for
    entry, as after a Bun timer. A turn checkpoints that way after every callback (§4.2).
-3. **Calling into JavaScript from a run-loop source during a modal session and during live resize.**
-   AppKit holds no lock JavaScript could re-enter, but this is to be verified per mode by test 1.
+3. **Calling into JavaScript from a run-loop source during a modal session and during live resize.
+   Answered: it works in both (§11, test 1).** In a modal session started through the trampoline,
+   main-loop timers ran at 100% of nominal, frames at the display's rate and a thread's messages in
+   order, and a main-loop timer stopped the session with `stopModal` from inside it. In a
+   synthesized live resize the same, and a `GPUView` drew through it with no frame the wrong size.
+   The one thing building it found was on the run loop's side, not AppKit's: a timer moved from
+   inside its own callout during the resize stopped firing in the default mode afterwards (§4.1).
 4. **`bun:ffi` and `JSCallback` in threads under load.** Lifetimes across threads, termination with
    calls in flight, and an hour's soak. A library's own thread-safety (hiettlight's Rust runtime,
-   for one) is that library's question.
-5. **`callbackDepth` coverage.** Audit every native → JavaScript entry (`dispatchCallback`, blocks,
-   `net`, `video`, `metal`). One that doesn't count is a safe point that isn't one.
+   for one) is that library's question. **Answered: see `experiments/threads-ffi.ts`** — RESULT.
+5. **`callbackDepth` coverage. Answered: every entry counts.** It is counted in native code, around
+   the call, not in JavaScript:
+   - `dispatchCallback` — every delegate, action, data source and subclass method — and every
+     block: one trampoline (`br_trampoline`, `closures.m`) increments it around every call;
+   - a main-loop turn (`mainloop.m`), and the §6.2 stack capture;
+   - the application's stop callback (`applicationShouldTerminate:`, `runloop.m`), which did not
+     count before the audit and now does;
+   - `net`: its `threadsafe` callback is never called from native code on the main thread's stack —
+     `net.m` calls it from its own queue, and Bun runs it as a task of its own loop, where `inPump`
+     is clear — and its main-loop deliveries are turns;
+   - `video` and `metal` make no calls into JavaScript: completion is polled (`metal/view.ts`), and
+     a drawable thread and the compile and MetalFX jobs only wake the pump.
+
+   A `JSCallback` an app makes for itself and hands to native code that calls it on the main thread
+   is outside BunKit's reach; `counted(fn)` (`bunkit/runtime`) wraps its body so it counts.
 
 ---
 
@@ -570,6 +681,7 @@ In `docs/main-loop/experiments/`, run with `bun <file>` from that folder:
 | `deliver.ts` (+ `poster.ts`) | E3: a worker putting a main-thread function on GCD's main queue during a nested second. |
 | `displaylink.ts` | E5: display-link callbacks in the default and tracking modes, with the modes named by strings (none) and by the frameworks' constants (the display's rate). |
 | `checkpoint.ts` | E6: nextTicks, promise reactions and `queueMicrotask` queued from a common-modes timer inside a nested loop, under each candidate checkpoint, against Bun's own order. |
+| `threads-ffi.ts` (+ `ffi-worker.ts`) | Open question 4: four threads at a time calling into native code that calls back into them (`qsort` with a JavaScript comparator, `br_main_signal`, JSCallbacks made and closed), each ended mid-call 5–200 ms after it started and replaced, for `SECONDS` (an hour for the soak), while the main thread pumps, runs main-loop timers and receives every thread's messages. |
 
 E4 is one line:
 `const a = new Int32Array(new SharedArrayBuffer(4)); Atomics.waitAsync(a, 0, 0, 1000).value.then(…); setTimeout(() => Atomics.notify(a, 0), 20)`.

@@ -11,6 +11,7 @@ import {
   GroupBox,
   HStack,
   Label,
+  MainLoop,
   Progress,
   ScrollView,
   Segmented,
@@ -44,8 +45,7 @@ const people: Person[] = [
 
 const app = new Application({
   name: "BunKit Demo",
-  // Shutdown work belongs here: the process ends when run() returns, and this
-  // app has two setIntervals that would otherwise keep Bun alive forever.
+  // Shutdown work belongs here: the process ends when run() returns.
   onQuit: () => console.log("clean exit"),
   menu: {
     file: [
@@ -236,16 +236,17 @@ async function onAskName() {
   log(`alert -> ${r.title}${r.suppressed ? " (suppressed)" : ""}`);
 }
 
-// JS timers, promises and fetch all keep running while AppKit owns the screen.
-setInterval(() => {
+// UI refreshes on BunKit's main loop rather than setInterval: these keep ticking while a menu is
+// open, a window is being resized or a slider is being dragged, where Bun's own timers stop.
+MainLoop.every(1000, () => {
   clock.text = new Date().toLocaleTimeString();
-}, 1000);
+});
 
 let p = 0;
-setInterval(() => {
+MainLoop.every(120, () => {
   p = (p + 3) % 101;
   progress.value = p;
-}, 120);
+});
 
 table.select(0);
 showDetail(people[0]!);
