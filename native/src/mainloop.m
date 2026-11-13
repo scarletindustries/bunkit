@@ -460,14 +460,19 @@ void br_main_pump_end(double seconds) {
 static void observe(CFRunLoopObserverRef observer, CFRunLoopActivity activity, void* info) {
   if (activity == kCFRunLoopEntry) {
     atomic_fetch_add(&g_br_main.nesting, 1);
-    br_entry e = {br_now(), -1, 1};
+    br_entry e = {0, -1, 0};
+    if (g_pump_waiting && g_entry_depth == g_pump_wait_depth) {
+      // The pump's own wait, many times a second: nothing to measure, so nothing looked up.
+      finish_unsafe();
+      if (g_entry_depth < MAX_DEPTH) g_entries[g_entry_depth] = e;
+      g_entry_depth++;
+      return;
+    }
+    e.start = br_now();
     CFStringRef mode = CFRunLoopCopyCurrentMode(g_rl);
     e.mode = mode_index(mode);
     if (mode) CFRelease(mode);
-    if (g_pump_waiting && g_entry_depth == g_pump_wait_depth) {
-      e.kind = 0;
-      finish_unsafe();
-    } else if (br_main_is_safe()) {
+    if (br_main_is_safe()) {
       finish_unsafe();
       if (g_dispatch_depth > 0) {
         e.kind = 1;
@@ -711,10 +716,14 @@ void br_main_init(void* turn, void* stack, void* wake) {
   ctx.perform = source_perform;
   g_source = CFRunLoopSourceCreate(NULL, 0, &ctx);
   CFRunLoopAddSource(g_rl, g_source, kCFRunLoopCommonModes);
-  // First in, last out, so it brackets everything else on the run loop.
+  // First in, last out, so it brackets everything else on the run loop. In the modes AppKit's
+  // nested loops run in — tracking (menus, live resize, drags) and modal panels — and not the
+  // default mode, which the pump itself waits in many times a second: observed there, the two
+  // callouts a wait made cost every pump an eighth more than v1's (§11, test 8).
   CFRunLoopObserverRef observer = CFRunLoopObserverCreate(
       NULL, kCFRunLoopEntry | kCFRunLoopExit, true, LONG_MIN, observe, NULL);
-  CFRunLoopAddObserver(g_rl, observer, kCFRunLoopCommonModes);
+  CFRunLoopAddObserver(g_rl, observer, (CFStringRef)NSEventTrackingRunLoopMode);
+  CFRunLoopAddObserver(g_rl, observer, (CFStringRef)NSModalPanelRunLoopMode);
   NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
   for (NSString* name in @[NSApplicationDidChangeScreenParametersNotification,
                            NSWindowDidChangeScreenNotification]) {

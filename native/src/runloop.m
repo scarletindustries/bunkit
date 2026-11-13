@@ -29,7 +29,12 @@ static br_void_fn   g_stop_cb = NULL;
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender {
   (void)sender;
   g_stop = 1;
-  if (g_stop_cb) g_stop_cb(0, 0, NULL, NULL);
+  if (g_stop_cb) {
+    // A native → JavaScript entry like any other: counted, so no main-loop turn starts inside it.
+    atomic_fetch_add(&g_br_main.callbackDepth, 1);
+    g_stop_cb(0, 0, NULL, NULL);
+    atomic_fetch_sub(&g_br_main.callbackDepth, 1);
+  }
   return NSTerminateCancel;
 }
 

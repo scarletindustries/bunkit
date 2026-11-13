@@ -370,6 +370,25 @@ export function runInTurn<A>(fn: (arg: A) => void, arg: A): void {
   runCallback(fn as (arg?: unknown) => void, arg);
 }
 
+/**
+ * Wrap a function native code will call on the main thread — the body of a `JSCallback` of your
+ * own — so the call counts as a native → JavaScript entry, and no main-loop turn starts while it
+ * runs (§3). BunKit's own entries count already: delegates, actions, blocks, its turns. A callback
+ * that does not count is a safe point that isn't one.
+ *
+ *   const cb = new JSCallback(counted((x: number) => …), { args: ["i32"], returns: "void" });
+ */
+export function counted<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R {
+  return (...args: A): R => {
+    U[U_CALLBACK_DEPTH]!++;
+    try {
+      return fn(...args);
+    } finally {
+      U[U_CALLBACK_DEPTH]!--;
+    }
+  };
+}
+
 /** Is a turn running now? */
 export function inTurn(): boolean {
   return turning;
@@ -786,6 +805,11 @@ function runTasks(deadline: number): boolean {
   return true;
 }
 
+/**
+ * One turn. Its fixed cost — the work source firing inside the pump, the call into JavaScript and
+ * back, the checks for work, the deadline left as it was — measured 0.25–0.3 µs on an M2 Pro, and
+ * each task in it 0.15 µs with its checkpoint (test/perf.ts).
+ */
 function turn(): void {
   const started = performance.now();
   const deadline = started + budgetMs;
@@ -998,6 +1022,20 @@ export const MainLoop = {
     return { dispose: stop, [Symbol.dispose]: stop };
   },
 };
+
+/** For tests: how much the main loop is holding on to, which a soak checks stays bounded. */
+export function mainLoopInternals(): Record<string, number> {
+  return {
+    timers: heap.length,
+    liveTimers: heap.filter((t) => t.live).length,
+    tasks: tasks.length - taskHead,
+    waiting: waiting.size,
+    subscribers: subscribers.size,
+    clocks: clocks.size,
+    sources: sources.size,
+    stacks: stacks.size,
+  };
+}
 
 /** For tests and tools: the main loop's view of the safe point (§3). */
 export function safePointState(): { inPump: number; callbackDepth: number; inTurn: boolean } {

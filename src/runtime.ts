@@ -80,6 +80,7 @@ export function initApp(policy: number = ActivationPolicy.Regular): void {
  */
 export {
   MainLoop,
+  counted,
   onFrame,
   frameTick,
   tickFrames,

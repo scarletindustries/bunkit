@@ -347,6 +347,10 @@ export class Channel {
   readonly #wake: () => void;
   readonly #handlers = new Set<Handler>();
   readonly #onListen: (listening: boolean) => void;
+  readonly #defer: (fn: () => void) => void;
+  /** What arrived before anyone listened: kept for the first handler, not dropped. */
+  #backlog: unknown[] = [];
+  #run: (fn: Handler, message: unknown) => void = (fn, m) => fn(m);
   #received = 0;
   /** Control messages: errors, exits and the like, for the side that owns this end. */
   onControl: ((message: any) => void) | undefined;
@@ -358,10 +362,12 @@ export class Channel {
     wake: () => void,
     options: ChannelOptions,
     onListen: (listening: boolean) => void = () => {},
+    defer: (fn: () => void) => void = queueMicrotask,
   ) {
     this.#out = out;
     this.#in = inbound;
     this.#wake = wake;
+    this.#defer = defer;
     this.#mode = options.backpressure ?? "fail";
     this.#waitMs = options.waitMs ?? 1000;
     this.#onListen = onListen;
@@ -392,10 +398,20 @@ export class Channel {
     return true;
   }
 
-  /** Hear every message from the other end, in order. */
+  /**
+   * Hear every message from the other end, in order. Messages that arrived before anything
+   * listened are kept, and the first handler hears them, soon after it is added.
+   */
   onMessage(fn: Handler): { dispose(): void; [Symbol.dispose](): void } {
     this.#handlers.add(fn);
     if (this.#handlers.size === 1) this.#onListen(true);
+    if (this.#handlers.size === 1 && this.#backlog.length > 0) {
+      const backlog = this.#backlog;
+      this.#backlog = [];
+      this.#defer(() => {
+        for (const m of backlog) for (const h of [...this.#handlers]) this.#run(h, m);
+      });
+    }
     const stop = () => {
       if (this.#handlers.delete(fn) && this.#handlers.size === 0) this.#onListen(false);
     };
@@ -437,6 +453,7 @@ export class Channel {
    * Stops at `deadline`; returns whether it delivered anything.
    */
   drain(deadline: number, run: (fn: Handler, message: unknown) => void): boolean {
+    this.#run = run;
     let any = false;
     for (;;) {
       const m = this.#in.read();
@@ -447,7 +464,8 @@ export class Channel {
         this.onControl?.(value);
       } else {
         this.#received++;
-        for (const h of [...this.#handlers]) run(h, value);
+        if (this.#handlers.size === 0) this.#backlog.push(value);
+        else for (const h of [...this.#handlers]) run(h, value);
       }
       if (performance.now() >= deadline) break;
     }
@@ -645,7 +663,7 @@ export class Thread {
     const fromThread = makeRing(ringBytes, arenaBytes);
     const down = new Ring(toThread);
     const up = new Ring(fromThread);
-    this.channel = new Channel(down, up, () => Atomics.notify(down.c, IDLE), options);
+    this.channel = new Channel(down, up, () => Atomics.notify(down.c, IDLE), options, () => {}, (fn) => main.MainLoop.post(fn));
     this.channel.onControl = (m) => this.#control(m);
     this.worker = new Worker(href, {
       workerData: {

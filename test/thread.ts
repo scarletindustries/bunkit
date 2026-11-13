@@ -66,6 +66,17 @@ function inOrder(seqs: number[]): boolean {
 // Order, both ways, and coalesced wake-ups
 // ---------------------------------------------------------------------------
 {
+  // Sent before the thread has started, let alone listened: kept for its first handler.
+  const early = spawnThread(WORKER, { name: "early" });
+  const got: any[] = [];
+  early.channel.send({ cmd: "ping", n: 7 });
+  await Bun.sleep(100);
+  early.channel.onMessage((m) => got.push(m));
+  await until(() => got.some((m) => m?.pong === 7), 5000);
+  check("a message sent before the thread listens is kept for it, and one it sent before we listened for us", got.some((m) => m?.pong === 7) && got.some((m) => m?.ready), got);
+  await early.terminate();
+}
+{
   const { thread, got } = await start({ name: "order" });
   check("a thread starts and says so", thread.name === "order");
   const N = 20_000;
