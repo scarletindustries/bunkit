@@ -27,6 +27,10 @@
 //
 // A payload larger than half the ring goes through the channel's arena, a second ring of bytes
 // that grows to fit, and the ring carries a handle to it.
+//
+// AppKit belongs to the main thread: a thread talks to the UI through its channel and its cells,
+// and never imports BunKit's objc or ui layers. bunkit/net works in a thread, delivered by that
+// thread's own loop, but in one thread at a time.
 
 import { dlopen, FFIType } from "bun:ffi";
 import { deserialize, serialize } from "bun:jsc";

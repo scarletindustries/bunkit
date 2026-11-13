@@ -12,6 +12,7 @@
 // pretend to be (§10).
 
 import { drainMicrotasks } from "bun:jsc";
+import { isMainThread } from "node:worker_threads";
 import { lib, asPointer, toArrayBuffer, JSCallback, FFIType, LIB_PATH } from "./bridge.ts";
 
 // ---------------------------------------------------------------------------
@@ -211,6 +212,10 @@ const wakeCallback = new JSCallback(
 /** Install the main loop on the main run loop. Safe to call more than once. */
 export function ensureMainLoop(): void {
   if (initialised) return;
+  if (!isMainThread) {
+    // Its turns would be calls from the main run loop into this thread's VM.
+    throw new Error("the main loop is the main thread's: a thread uses its own loop, and its channel (bunkit/thread)");
+  }
   initialised = true;
   lib.br_main_init(turnCallback.ptr, DEV ? stackCallback.ptr : null, wakeCallback.ptr);
   // After this no native thread calls into a VM that is going away.
