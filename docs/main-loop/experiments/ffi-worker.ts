@@ -2,7 +2,7 @@
 // moment. bun:ffi into BunKit's own library (signalling the main loop), a JSCallback that native
 // code calls on this thread (libc's qsort, with a JavaScript comparator), JSCallbacks made and
 // closed, and messages to the main thread — all in a loop that never waits for anything.
-import { dlopen, FFIType, JSCallback, ptr } from "bun:ffi";
+import { dlopen, FFIType, JSCallback, ptr, read } from "bun:ffi";
 import { parent } from "../../../src/thread.ts";
 import { workerData } from "node:worker_threads";
 
@@ -12,13 +12,13 @@ const libc = dlopen("/usr/lib/libSystem.B.dylib", {
 }).symbols;
 
 const values = new Int32Array(64);
-const view = new DataView(values.buffer);
-const base = Number(ptr(values));
 let compares = 0;
 const comparator = new JSCallback(
+  // Read through the pointers themselves: qsort may hand over a copy of an element, not one in
+  // the array.
   (a: number, b: number) => {
     compares++;
-    return view.getInt32(a - base, true) - view.getInt32(b - base, true);
+    return read.i32(a as any, 0) - read.i32(b as any, 0);
   },
   { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
 );

@@ -26,7 +26,11 @@
 // loop, which is stopped while AppKit nests.
 //
 // A payload larger than half the ring goes through the channel's arena, a second ring of bytes
-// that grows to fit, and the ring carries a handle to it.
+// as large as the largest message the channel will carry, and the ring carries a handle to it.
+// The arena is a plain SharedArrayBuffer, not a growable one: measured on Bun 1.4.4, a growable
+// SharedArrayBuffer shared with a worker leaves memory behind every time the worker is ended
+// (about 5 KB each; 9 → 20 MB over 2,000 workers), where a plain one does not — and costs nothing
+// resident until a large message actually passes through it.
 //
 // AppKit belongs to the main thread: a thread talks to the UI through its channel and its cells,
 // and never imports BunKit's objc or ui layers. bunkit/net works in a thread, delivered by that
@@ -51,7 +55,6 @@ const WAITING = 36; // the producer is waiting for room
 const SENT = 37;
 const ARENA_HEAD = 48;
 const ARENA_TAIL = 56;
-const ARENA_CAP = 57;
 const CONTROL_WORDS = 64;
 
 const HEADER = 8; // u32 length, u8 tag, u8 flags, u16 unused
@@ -73,9 +76,8 @@ function makeRing(bytes: number, arenaBytes: number): RingBuffers {
   const cap = 1 << Math.ceil(Math.log2(Math.max(4096, bytes)));
   const arenaCap = 1 << Math.ceil(Math.log2(Math.max(4096, arenaBytes)));
   const control = new SharedArrayBuffer(CONTROL_WORDS * 4);
-  const arena = new SharedArrayBuffer(arenaCap, { maxByteLength: 1 << 30 } as any);
+  const arena = new SharedArrayBuffer(arenaCap);
   const c = new Int32Array(control);
-  c[ARENA_CAP] = arenaCap;
   c[IDLE] = 1; // armed from the start: the first message signals
   return { control, data: new SharedArrayBuffer(cap), arena };
 }
@@ -87,7 +89,7 @@ class Ring {
   readonly view: DataView;
   readonly cap: number;
   readonly mask: number;
-  readonly arenaBuffer: SharedArrayBuffer & { grow(n: number): void; maxByteLength: number };
+  readonly arena: Uint8Array;
 
   constructor(readonly buffers: RingBuffers) {
     this.c = new Int32Array(buffers.control);
@@ -95,7 +97,7 @@ class Ring {
     this.view = new DataView(buffers.data);
     this.cap = this.data.length;
     this.mask = this.cap - 1;
-    this.arenaBuffer = buffers.arena as any;
+    this.arena = new Uint8Array(buffers.arena);
   }
 
   get pending(): boolean {
@@ -163,17 +165,7 @@ class Ring {
   #arenaRoom(need: number): boolean {
     const head = Atomics.load(this.c, ARENA_HEAD);
     const tail = Atomics.load(this.c, ARENA_TAIL);
-    let cap = Atomics.load(this.c, ARENA_CAP);
-    if (need > cap) {
-      // Grown only while empty, so no message in flight is mapped by the old size.
-      if (head !== tail) return false;
-      const grown = 1 << Math.ceil(Math.log2(need));
-      if (grown > this.arenaBuffer.maxByteLength) return false;
-      if (this.arenaBuffer.byteLength < grown) this.arenaBuffer.grow(grown);
-      Atomics.store(this.c, ARENA_CAP, grown);
-      cap = grown;
-    }
-    return cap - ((tail - head) >>> 0) >= need;
+    return this.arena.length - ((tail - head) >>> 0) >= need;
   }
 
   /** Write one message. False if it was not sent: the ring stayed full, or it is closed. */
@@ -182,7 +174,8 @@ class Ring {
     const large = HEADER + align8(bytes.length) > this.cap >> 1;
     const need = large ? HEADER + 8 : HEADER + align8(bytes.length);
     const arenaNeed = large ? align8(bytes.length) : 0;
-    if (!this.#room(need, arenaNeed, mode, waitMs)) {
+    // Larger than the arena: it could never be sent, so it is refused rather than waited for.
+    if (arenaNeed > this.arena.length || !this.#room(need, arenaNeed, mode, waitMs)) {
       Atomics.add(this.c, DROPPED, 1);
       return false;
     }
@@ -193,8 +186,7 @@ class Ring {
     this.data[at + 5] = large ? FLAG_ARENA : 0;
     if (large) {
       const arenaTail = Atomics.load(this.c, ARENA_TAIL);
-      const cap = Atomics.load(this.c, ARENA_CAP);
-      this.#copyIn(new Uint8Array(this.arenaBuffer, 0, cap), cap - 1, arenaTail, bytes);
+      this.#copyIn(this.arena, this.arena.length - 1, arenaTail, bytes);
       Atomics.store(this.c, ARENA_TAIL, (arenaTail + arenaNeed) | 0);
       this.view.setUint32((tail + HEADER) & this.mask, arenaTail >>> 0, true);
     } else {
@@ -220,8 +212,7 @@ class Ring {
         const arenaPos = this.view.getUint32((head + HEADER) & this.mask, true);
         // Claimed first: a message in the arena is never dropped, so this always holds.
         if (Atomics.compareExchange(this.c, HEAD, head, (head + size) | 0) !== head) continue;
-        const cap = Atomics.load(this.c, ARENA_CAP);
-        const bytes = this.#copyOut(new Uint8Array(this.arenaBuffer, 0, cap), cap - 1, arenaPos, length);
+        const bytes = this.#copyOut(this.arena, this.arena.length - 1, arenaPos, length);
         Atomics.store(this.c, ARENA_HEAD, (arenaPos + align8(length)) | 0);
         this.#released();
         return { tag, bytes };
@@ -626,7 +617,11 @@ export interface SpawnOptions extends ChannelOptions {
   name?: string;
   /** Each ring's size, bytes. Default 1 MiB. Messages over half of it go through the arena. */
   ringBytes?: number;
-  /** The arena's starting size, bytes; it grows to fit the largest message. Default 4 MiB. */
+  /**
+   * Each direction's arena, bytes, rounded up to a power of two: the largest message the channel
+   * carries. A larger one is refused (`send` returns false). Default 16 MiB, which costs nothing
+   * resident until large messages pass through it.
+   */
   arenaBytes?: number;
 }
 
@@ -662,7 +657,7 @@ export class Thread {
     const href = typeof url === "string" ? url : url.href;
     this.name = options.name ?? href.split("/").pop()!.replace(/\.[jt]s$/, "");
     const ringBytes = options.ringBytes ?? 1 << 20;
-    const arenaBytes = options.arenaBytes ?? 4 << 20;
+    const arenaBytes = options.arenaBytes ?? 16 << 20;
     const toThread = makeRing(ringBytes, arenaBytes);
     const fromThread = makeRing(ringBytes, arenaBytes);
     const down = new Ring(toThread);

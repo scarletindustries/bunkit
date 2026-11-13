@@ -457,9 +457,14 @@ const safety = show.cell(SafetyLayout, "write");       // a shared cell, §7.4
   AppKit nests.
 - **Encoding:** structured clone through `bun:jsc`'s native `serialize`, with fast paths that send
   strings, `ArrayBuffer`s and every typed array as their bytes and give them back as what they
-  were. A payload over half the ring goes in the channel's arena — a second ring of bytes, a
-  growable `SharedArrayBuffer` that grows (only while empty) to fit the largest message — and the
-  ring carries its handle: 8 MiB messages through a 4 KiB ring, both ways, intact (§11, test 4).
+  were. A payload over half the ring goes in the channel's arena — a second ring of bytes, as
+  large as the largest message the channel carries (`arenaBytes`, default 16 MiB; a larger one is
+  refused) — and the ring carries its handle: 8 MiB messages through a 4 KiB ring, both ways,
+  intact (§11, test 4). *Measured:* the arena is a plain `SharedArrayBuffer`, which costs nothing
+  resident until a large message passes through it. A growable one, shared with a worker, leaves
+  memory behind each time that worker is ended (Bun 1.4.4: 9 → 20 MB over 2,000 workers; a plain
+  one, and a growable one never shared, stay flat). Built growable at first, it was found by the
+  soak of open question 4.
 - **Backpressure** is chosen per channel: `drop-oldest` (telemetry), `fail` (the caller decides;
   `send` returns false), or `wait` (bounded `Atomics.wait`, off the main thread only; on the main
   thread it is `fail`). The consumer claims a message with a compare-and-swap of the head after

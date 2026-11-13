@@ -324,7 +324,7 @@ const Safety = cellLayout("safety", { live: true, haze: 1 });
 const safety = show.cell(Safety, "write");        // the thread reads it every frame
 ```
 
-the channel is a ring each way in shared memory. a message from a thread signals the main loop's run-loop source, so it's delivered inside menus and resizes, in order, and a busy stream costs one wake-up per turn rather than one per message. strings and typed arrays go as their bytes, anything else as a structured clone, and a big message goes through an arena that grows to fit. a shared cell is a fixed set of numbers with one writer behind a seqlock: no messages, the latest value wins. an uncaught error in a thread comes back with its stack, and threads are ended on quit against one deadline, so a stuck one is abandoned rather than waited for.
+the channel is a ring each way in shared memory. a message from a thread signals the main loop's run-loop source, so it's delivered inside menus and resizes, in order, and a busy stream costs one wake-up per turn rather than one per message. strings and typed arrays go as their bytes, anything else as a structured clone, and a big message (up to 16 MiB by default) goes through an arena beside the ring. a shared cell is a fixed set of numbers with one writer behind a seqlock: no messages, the latest value wins. an uncaught error in a thread comes back with its stack, and threads are ended on quit against one deadline, so a stuck one is abandoned rather than waited for.
 
 ### the annoying parts
 

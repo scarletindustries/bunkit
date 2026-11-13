@@ -168,7 +168,7 @@ for (const mode of ["fail", "drop-oldest"] as const) {
 // Messages larger than the ring: through the arena
 // ---------------------------------------------------------------------------
 {
-  const { thread, got } = await start({ name: "arena", ringBytes: 4096, arenaBytes: 64 * 1024 });
+  const { thread, got } = await start({ name: "arena", ringBytes: 4096 });
   for (const [bytes, seed] of [[1 << 20, 3], [8 << 20, 4]] as const) {
     got.length = 0;
     thread.channel.send({ cmd: "big", bytes, seed });
@@ -177,7 +177,7 @@ for (const mode of ["fail", "drop-oldest"] as const) {
     const want = pattern(bytes, seed);
     let same = back?.length === want.length;
     for (let i = 0; same && i < want.length; i++) same = back![i] === want[i];
-    check(`a ${bytes >> 20} MiB message from a thread, through a 4 KiB ring and a growing arena, arrives intact`, same, back?.length);
+    check(`a ${bytes >> 20} MiB message from a thread, through a 4 KiB ring and its arena, arrives intact`, same, back?.length);
 
     got.length = 0;
     thread.channel.send({ cmd: "check-big", bytes, seed });
@@ -186,6 +186,15 @@ for (const mode of ["fail", "drop-oldest"] as const) {
     const verdict = got.find((m) => m?.bigIntact !== undefined);
     check(`and a ${bytes >> 20} MiB message to it`, sent && verdict?.bigIntact === true, verdict);
   }
+  await thread.terminate();
+}
+{
+  // Larger than the arena: refused at once, not waited for, and the channel goes on working.
+  const { thread, got } = await start({ name: "small arena", ringBytes: 4096, arenaBytes: 64 * 1024, backpressure: "wait" });
+  const sent = thread.channel.send(pattern(1 << 20, 5));
+  thread.channel.send({ cmd: "ping", n: 9 });
+  await until(() => got.some((m) => m?.pong === 9), 5000);
+  check("a message larger than the arena is refused, and the channel carries on", !sent && got.some((m) => m?.pong === 9) && thread.channel.stats.dropped === 1, thread.channel.stats);
   await thread.terminate();
 }
 
