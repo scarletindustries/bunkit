@@ -56,17 +56,19 @@ bun run bundle examples/demo.ts --name "My App" --id com.example.myapp --icon ic
 open "dist/My App.app"
 ```
 
+an app that starts threads has to have them compiled in as well, with one `--worker src/show.ts` per thread.
+
 ### how it works
 
 the objective-c runtime will hand you the full type signature of any method, so one bridge reads that and calls `objc_msgSend` through libffi instead of there being a wrapper per method. three layers sit on top of it:
 
 | | | |
 |---|---|---|
-| `src/ui/` | layer 3 | `Window`, `VStack`, `Button`, `Table`, 26 classes |
+| `src/ui/` | layer 3 | `Window`, `VStack`, `Button`, `Table`, `Toolbar`, `SplitLayout`, 36 classes |
 | `src/objc.ts` | layer 2 | `objc.NSWindow.alloc().init…()`, marshalling, delegates, blocks |
 | `src/bridge.ts` | layer 1 | dlopen, packing arguments into buffers |
 
-every layer 3 object has a `.native` for when you need to drop to layer 2, which reaches all of appkit. [the bridge](https://scarlet.industries/docs/bunkit/bridge) and [metal](https://scarlet.industries/docs/bunkit/metal) docs cover the rest.
+every layer 3 object has a `.native` for when you need to drop to layer 2, which reaches all of appkit. `bunkit/net` talks to other macs nearby and `bunkit/thread` runs work off the main thread. [the bridge](https://scarlet.industries/docs/bunkit/bridge), [metal](https://scarlet.industries/docs/bunkit/metal) and [main loop](docs/main-loop/spec.md) docs cover the rest.
 
 ### 3d
 
@@ -83,9 +85,19 @@ const cube = scene.add(box({ size: 1.1, position: [0, 0.55, 0], color: "#aa091b"
 scene.onFrame(({ dt }) => { cube.rotation.y += dt; });
 ```
 
+it draws at the rate of the screen it's on, and keeps drawing while a menu is open or the window's being resized.
+
 ### the annoying parts
 
-appkit runs its own nested run loop for modal dialogs, menu tracking, live resize and drags, and js is frozen the whole time it's in there. so the dialogs are sheets that hand you a promise, and menu tracking and live resize pause the app until someone lets go of the mouse.
+appkit runs its own nested run loop for menu tracking, live resize, drags and modal sessions, and bun's event loop doesn't get a turn the whole time it's in there. no `setTimeout`, no promises, no i/o. bunkit has a main loop of its own that does keep running in there, between appkit's callbacks and never in the middle of your code, so anything on screen should go on that instead of `setInterval`:
+
+```ts
+import { MainLoop } from "bunkit";
+
+MainLoop.every(1000, () => { greeting.text = new Date().toLocaleTimeString(); });
+```
+
+anything that has to keep going whatever the window is doing, like a socket or a clock that keeps time, goes on a thread from `spawnThread`. it talks to the main thread over a channel that gets through during a menu too. appkit stays on the main thread, so a thread leaves it alone. the dialogs are sheets and `popUpMenu` opens from the loop, so they all hand you a promise. if your own code starts a nested loop through layer 2 (a `runModal`, say), the main loop waits until it returns, and bunkit warns you, with the line it came from when you're running from source.
 
 pointers are `bigint`, not `number`, so compare against `0n`.
 
