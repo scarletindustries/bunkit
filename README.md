@@ -63,7 +63,7 @@ open "dist/My App.app"
 
 `--icon` takes a 1024×1024 `.png`, a ready `.icns`, or an icon composer `.icon`, which xcode 26's `actool` compiles into the `Assets.car` macOS 26 draws as liquid glass (with an `.icns` beside it for older systems).
 
-a worker the app starts with `new Worker(new URL("./name.ts", import.meta.url))` has to be compiled in too, or it loads from source and fails in the app: pass it with `--worker src/name.ts` (or `workers` in a config). it lands at the root of the bundled file system under its own file name, which is where that url points in the binary.
+a worker the app starts with `spawnThread(new URL("./name.ts", import.meta.url))` (or a plain `new Worker` with the same url) has to be compiled in too, or it loads from source and fails in the app: pass it with `--worker src/name.ts` (or `workers` in a config). it lands at the root of the bundled file system under its own file name, which is where that url points in the binary.
 
 ### how?
 
@@ -240,7 +240,7 @@ content under a sidebar or a toolbar also wants its camera centred on what's vis
 
 `bun run rig` is the example.
 
-it's a `CAMetalLayer` rather than an `MTKView`, so frames come from bunkit's run loop instead of a second one. `.native` is on every object if you want the raw obj-c, and `scene.capture()` / `scene.snapshot()` read the framebuffer back — which is how all of this is tested, since nobody is watching.
+it's a `CAMetalLayer` rather than an `MTKView`, so frames come from bunkit's main loop — a display link per screen, so a view draws at the rate of the screen it's on, and keeps drawing through menus and live resize — instead of a second one. `.native` is on every object if you want the raw obj-c, and `scene.capture()` / `scene.snapshot()` read the framebuffer back — which is how all of this is tested, since nobody is watching.
 
 ### peer to peer
 
@@ -266,7 +266,7 @@ a message is a 4-byte big-endian length and the bytes, at most 16 MiB, checked b
 
 `tls: { psk, identity }` on a listener, a browser or a connection turns on tls with a pre-shared key: tls 1.2 with `TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256` and nothing else, so the key authenticates both ends and each connection still gets its own ephemeral secret. a wrong key fails in milliseconds and never reaches `onConnection`; a listener can hold several keys (one per paired peer) and picks by identity. the identity goes over the wire in the clear, so make it opaque. it isn't tls 1.3 because that doesn't work from here: on macOS 26.6 every tls 1.3 configuration with `sec_protocol_options_add_pre_shared_key` fails its handshake (-9858) even with the right key, and offered both versions it settles on 1.2.
 
-none of it runs on the main thread except your handlers. network.framework gets a private serial queue (`native/src/net.m`), where the reading, the framing and the copy into each message all happen; javascript takes whole messages in batches, woken by a `threadsafe` bun:ffi callback and — inside the run loop — an empty event that ends the pump's wait. a received message isn't copied again: the buffer it was put together in becomes the `Uint8Array`'s memory, freed when that's collected. `send` copies the bytes and returns (0.2 ms for 1 MiB, ~1.5 ms for 16 MiB), and its promise is the backpressure. a receiver that falls behind stops reading at 64 MiB per connection, so tcp's window closes and the sender's sends stop completing, rather than memory growing.
+none of it runs on the main thread except your handlers. network.framework gets a private serial queue (`native/src/net.m`), where the reading, the framing and the copy into each message all happen; javascript takes whole messages in batches, in a turn of bunkit's main loop — so they keep arriving while a menu is open or a window is being resized — or, in a script that never pumps, from a `threadsafe` bun:ffi callback. a received message isn't copied again: the buffer it was put together in becomes the `Uint8Array`'s memory, freed when that's collected. `send` copies the bytes and returns (0.2 ms for 1 MiB, ~1.5 ms for 16 MiB), and its promise is the backpressure. a receiver that falls behind stops reading at 64 MiB per connection, so tcp's window closes and the sender's sends stop completing, rather than memory growing.
 
 measured on an m2 pro over loopback:
 
@@ -275,7 +275,7 @@ measured on an m2 pro over loopback:
 | 1 MiB messages | ~4,000 MiB/s; ~1,600 MiB/s with the main thread busy 8 ms in every 10 |
 | 16 MiB messages | ~4,400 MiB/s; ~3,400 MiB/s with the main thread that busy |
 | a 1 ms timer's worst gap meanwhile | 1.2–1.8 ms in plain bun; 3–4.6 ms inside the run loop, most of it the pump's own 4 ms wait |
-| a small message's round trip | 0.12 ms median, 0.15 ms inside the run loop |
+| a small message's round trip | 0.12 ms median, in plain bun and inside the run loop alike |
 
 handing network.framework the main queue instead was measured too, and lost: in a process that doesn't pump nothing moves at all, and with the main thread busy 8 ms in 10 it did 957 MiB/s against 1,544, and 1,368 against 3,527 with 16 MiB messages.
 
@@ -292,9 +292,41 @@ loopback never needs it. `advertise: false` makes a listener without bonjour, re
 
 to try awdl between two macs, turn wi-fi on in both but join no network (or be somewhere no network is known), unplug ethernet, and run `bun run tools/peer-check.ts` on each. they find each other on `awdl0`, connect, and print the route, the round trip and the throughput. `--tls <word>` does the same over tls, `--no-p2p` leaves awdl out.
 
-### the annoying parts
+### the main loop
 
-appkit runs its own nested run loop for modal dialogs, menu tracking, live resize and drags, and js is frozen the whole time it's in there. dialogs were the worst of it, so layer 3 gives you sheets instead: `alert`, `confirm`, `prompt`, `openFile` and `saveFile` all hand you a promise and the pump keeps ticking underneath. `alert` and `prompt` fall back to a blocking modal when there's no window to hang a sheet on, which is the only place `runModal` gets reached. menu tracking and live resize you just live with. they're bounded by someone letting go of the mouse.
+appkit takes the main thread and keeps it until someone lets go of the mouse: an open menu, a live resize, a modal session. bun can't run its event loop from inside a native call, so for as long as appkit holds on, nothing of bun's runs — no `setTimeout`, no i/o, no promise continuations. that used to mean frozen animations and stalled sockets every time a menu opened.
+
+so bunkit has a main loop of its own, on appkit's run loop in its common modes, which keeps running in there:
+
+```ts
+import { MainLoop, onFrame } from "bunkit/runtime";
+
+MainLoop.every(100, () => refreshStatus());   // still ticks while a menu is open
+onFrame(({ targetTimestamp }) => animate(targetTimestamp));
+const chosen = await popUpMenu(items, view);  // opened from the pump, so none of yours is on the stack
+```
+
+it only ever runs at a safe point — when the only javascript on the stack is bunkit's own pump — and each run is a whole turn with a microtask checkpoint after every callback, so run-to-completion holds: nothing of the main loop's starts while a function of yours is halfway through. `MainLoop.after`, `every`, `post`, `sleep` and `nextFrame` are deliberately not `setTimeout`, and nothing global is patched. frames come from a display link per screen, so a view draws at the rate of the screen it's on, through live resize too. `MainLoop.stats` says how long the main thread was held, by what, and how late the loop ran, and `MainLoop.onStall` tells you when it happens.
+
+anything that would start a nested loop from your call is opened from the pump instead: `popUpMenu` hands you a promise of the item chosen, and `sendFromPump` (layer 2) does the same for any call. dialogs are sheets — `alert`, `confirm`, `prompt`, `openFile` and `saveFile` all hand you a promise — and hang from a transparent host window when there's no window to hang one on, so `runModal` is never reached. a nested loop you start yourself through layer 2 still works, keeps run-to-completion, and pauses the main loop; bunkit says so, once per call site, with the line it came from. the design and every measurement behind it are in [the main loop spec](docs/main-loop/spec.md).
+
+### threads
+
+work that mustn't stop — a show's clock, a socket someone's waiting on — belongs on a thread, whose bun loop appkit never touches:
+
+```ts
+import { spawnThread, cellLayout } from "bunkit/thread";
+
+const show = spawnThread(new URL("./show.ts", import.meta.url), { name: "show" });
+show.channel.send({ kind: "load", path });
+show.channel.onMessage((m) => status(m));        // arrives during a menu too
+const Safety = cellLayout("safety", { live: true, haze: 1 });
+const safety = show.cell(Safety, "write");        // the thread reads it every frame
+```
+
+the channel is a ring each way in shared memory. a message from a thread signals the main loop's run-loop source, so it's delivered inside menus and resizes, in order, and a busy stream costs one wake-up per turn rather than one per message. strings and typed arrays go as their bytes, anything else as a structured clone, and a big message (up to 16 MiB by default) goes through an arena beside the ring. a shared cell is a fixed set of numbers with one writer behind a seqlock: no messages, the latest value wins. an uncaught error in a thread comes back with its stack, and threads are ended on quit against one deadline, so a stuck one is abandoned rather than waited for.
+
+### the annoying parts
 
 `table.rows = …` updates the table in place when every column is text: rows get added or removed at the end, and only the cells whose text changed are touched. a full `reloadData` rebuilds every visible cell through the js datasource, and on a few dozen rows refreshed ten times a second that was a 35 ms stall on the main thread every tenth pass. a table with a `render` column still reloads, and `table.reload()` is there if you want the rebuild. `table.visibleRows` says which rows are on screen, for rows that cost something to work out.
 
@@ -315,7 +347,7 @@ bun test
 bun run typecheck
 ```
 
-a `msgSend` costs about 230ns, a callback from obj-c into js about 870ns, and idle cpu with a window open sits around 1.3%. a sixty second soak of several million calls holds flat.
+a `msgSend` costs about 230ns, a callback from obj-c into js about 870ns, a main-loop turn about 0.3µs, and idle cpu with a window open sits around 1.3–2%, the same as before the main loop. a sixty second soak of several million calls, main-loop timers, trampolined calls and thread messages holds flat.
 
 still missing: notarization (it only ad-hoc signs), an npm package (the dylib has to be compiled, so that needs prebuilt binaries), and swiftui hosting.
 

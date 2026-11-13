@@ -27,9 +27,12 @@
 //
 // Threading. Network.framework runs on a private serial queue in native/src/net.m, never on the
 // main thread: the reading, the framing and the copy into each message happen there, and
-// JavaScript only ever sees whole messages, taken in batches. A `threadsafe` bun:ffi callback
-// wakes Bun's event loop when there is something to take; the handlers then run on the main
-// thread like any other task. Nothing here waits: `send` copies the message and returns, and its
+// JavaScript only ever sees whole messages, taken in batches. When there is something to take,
+// the native side signals BunKit's main loop, whose turns run inside the pump and inside every
+// nested loop AppKit enters from event dispatch, so a peer's messages are delivered on the main
+// thread during a menu, a live resize or a slider drag (docs/main-loop/spec.md §7.5). It also
+// wakes Bun's event loop with a `threadsafe` bun:ffi callback, for a script that never pumps, and
+// for net used from a thread, where its deliveries run on that thread's loop. Nothing here waits: `send` copies the message and returns, and its
 // promise resolves when Network.framework has taken it — which is the backpressure. A received
 // message is wrapped, not copied: the buffer the native side assembled it in becomes the
 // `Uint8Array`'s memory, freed when it is collected.
@@ -37,7 +40,9 @@
 // Every object here stays open until it is closed, by either end — dropping it does not close
 // it, the same as a socket.
 
+import { isMainThread } from "node:worker_threads";
 import { lib, cstr, readCString, asPointer, FFIType, JSCallback, toArrayBuffer, type BunPointer } from "../bridge.ts";
+import { addTurnSource, Pending, requestTurn, runInTurn, takePending } from "../mainloop.ts";
 
 /** A native listener, browser or connection (net.m): a heap address, never an Obj-C object. */
 type Handle = BunPointer;
@@ -220,10 +225,29 @@ const wrapBytes = toArrayBuffer as unknown as (
   p: number, offset: number, length: number, context: number, deallocator: number,
 ) => ArrayBuffer;
 
+/** Events left after a turn's drain ran out of budget: the native side will not signal again. */
+let more = false;
+
 /** Start the native side once: the queue, the wake-up callback, the release at exit. */
 function ensureInit(): void {
   if (notify) return;
   notify = new JSCallback(() => drain(), { args: [], returns: FFIType.void, threadsafe: true });
+  if (isMainThread) {
+    // Delivered by the main loop's turns as well as by Bun's loop, so during menus too.
+    addTurnSource({
+      run(deadline) {
+        if (!more && !takePending(Pending.NET)) return false;
+        more = false;
+        runInTurn(() => {
+          drain(Math.max(0.5, deadline - performance.now()), () => {
+            more = true;
+            requestTurn();
+          });
+        }, undefined);
+        return true;
+      },
+    });
+  }
   lib.br_net_init(notify.ptr);
   releaseBytes = Number(lib.br_dlsym(cstr("br_net_release_bytes")));
   // After this no native thread calls into a VM that is going away.
@@ -266,12 +290,19 @@ function discard(kind: number, p: number): void {
 
 /**
  * Take everything the native side has for JavaScript and hand it to its owners, for up to
- * {@link DRAIN_BUDGET_MS}; past that, carry on in a later task so timers get a turn. Runs on the
- * main thread only — it is called by the wake-up callback (which Bun queues as a task) and the
- * keep-alive timer, never from another thread. A handler that throws is logged; the rest still
- * run. Returns how many events it handled.
+ * `budgetMs` ({@link DRAIN_BUDGET_MS} from Bun's loop, what is left of a turn's budget in the main
+ * loop); past that, `carryOn` arranges a later task, so timers get a turn. Runs on the thread
+ * that uses net — called by a main-loop turn, the wake-up callback (which Bun queues as a task)
+ * and the keep-alive timer. A handler that throws is logged; the rest still run. Returns how
+ * many events it handled.
  */
-function drain(): number {
+function drain(
+  budgetMs = DRAIN_BUDGET_MS,
+  carryOn: () => void = () => {
+    continuation = true;
+    setImmediate(drain);
+  },
+): number {
   if (draining) return 0;
   draining = true;
   continuation = false;
@@ -301,11 +332,10 @@ function drain(): number {
       }
       total += n;
       if (n < BATCH) break;
-      if (performance.now() - started > DRAIN_BUDGET_MS) {
+      if (performance.now() - started > budgetMs) {
         // More is waiting, and no wake-up will come for it: the native side only wakes us when
-        // its list goes from empty to not.
-        continuation = true;
-        setImmediate(drain);
+        // its list goes from empty to not. In a later task — Bun's, or the main loop's next turn.
+        carryOn();
         break;
       }
     }

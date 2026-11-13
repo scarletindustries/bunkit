@@ -7,8 +7,10 @@
 // Run it under zombies to catch over-releases at the same time:
 //   NSZombieEnabled=YES MallocScribble=1 bun run test/soak.ts
 
-import { createBlock, createDelegate, objc, stats, toJS } from "../src/objc.ts";
-import { initApp, pumpOnce } from "../src/runtime.ts";
+import { createBlock, createDelegate, objc, sendFromPump, stats, toJS } from "../src/objc.ts";
+import { initApp, MainLoop, onFrame, pumpOnce } from "../src/runtime.ts";
+import { mainLoopInternals } from "../src/mainloop.ts";
+import { liveThreads, spawnThread, type Thread } from "../src/thread.ts";
 import { Button, Label, Table, VStack, Window } from "../src/ui/index.ts";
 
 const SECONDS = Number(process.env.SOAK_SECONDS ?? 20);
@@ -40,6 +42,26 @@ const win = new Window({
   content: new VStack({ spacing: 8, padding: 12 }, [button, table]),
   show: true,
 });
+for (let i = 0; i < 30; i++) pumpOnce(0.004);
+
+// The main loop's side (docs/main-loop/spec.md §11, test 7): a thread streaming messages for the
+// whole soak, its cell read, and every round timers, tasks, frames, trampolined calls and
+// messages to it — and every so often a thread started and ended, its rings with it. Sources,
+// timers, rings and callbacks must all be let go.
+const WORKER = new URL("./fixtures/thread-worker.ts", import.meta.url);
+const streamer = spawnThread(WORKER, { name: "streamer" });
+let streamed = 0;
+let echoed = 0;
+streamer.channel.onMessage((m: any) => {
+  if (m?.tick !== undefined) streamed++;
+  else if (m?.pong !== undefined) echoed++;
+});
+streamer.channel.send({ cmd: "tick", ms: 2 });
+let timersRun = 0;
+let tasksRun = 0;
+let framesSeen = 0;
+let trampolined = 0;
+let shortLived = 0;
 for (let i = 0; i < 30; i++) pumpOnce(0.004);
 
 // Settle before the baseline: first-render allocations are not a leak.
@@ -87,6 +109,38 @@ while ((performance.now() - t0) / 1000 < SECONDS) {
     w.close();
   }
 
+  // 6. The main loop: timers made and dropped, tasks, frames, trampolined calls, and messages.
+  for (let i = 0; i < 20; i++) {
+    const t = MainLoop.after(i % 3, () => void timersRun++);
+    if (i % 2) t.dispose();
+  }
+  // Long ones, cancelled long before they are due: a debounce.
+  for (let i = 0; i < 20; i++) MainLoop.after(60_000, () => void timersRun++).dispose();
+  const every = MainLoop.every(1, () => void timersRun++);
+  for (let i = 0; i < 50; i++) MainLoop.post(() => void tasksRun++);
+  const stopFrames = onFrame(() => void framesSeen++);
+  if (rounds % 10 === 0) void MainLoop.nextFrame().then(() => void framesSeen++);
+  void sendFromPump(objc.NSString.stringWithUTF8String_(`soak ${rounds}`), "length").then(() => void trampolined++);
+  for (let i = 0; i < 5; i++) streamer.channel.send({ cmd: "ping", n: i });
+  for (let i = 0; i < 3; i++) pumpOnce(0.002);
+  every.dispose();
+  stopFrames();
+  if (rounds % 50 === 0) {
+    const t: Thread = spawnThread(WORKER, { name: `short ${rounds}`, ringBytes: 64 * 1024 });
+    let pong = false;
+    t.channel.onMessage((m: any) => {
+      if (m?.pong !== undefined) pong = true;
+    });
+    t.channel.send({ cmd: "ping", n: 1 });
+    const until = performance.now() + 2000;
+    while (!pong && performance.now() < until) {
+      pumpOnce(0.002);
+      await Bun.sleep(0);
+    }
+    await t.terminate();
+    if (pong) shortLived++;
+  }
+
   rounds++;
   if (rounds % 25 === 0) {
     Bun.gc(true);
@@ -109,6 +163,23 @@ console.log(`  RSS:              ${base.rss} MB -> ${end.rss} MB`);
 console.log(`  samples: ${samples.map((s) => `${s.t.toFixed(0)}s:${s.live}w/${s.rss}MB`).join("  ")}`);
 
 check("did real work", end.calls > 100000, end.calls);
+
+// The main loop let go of everything it was given.
+for (let i = 0; i < 50; i++) pumpOnce(0.004);
+const internals = mainLoopInternals();
+console.log(`  main loop:        ${timersRun} timers, ${tasksRun} tasks, ${framesSeen} frames, ${trampolined} trampolined calls`);
+console.log(`  thread:           ${streamed} messages streamed in, ${echoed} pings answered; ${shortLived} short-lived threads`);
+console.log(`  held now:         ${JSON.stringify(internals)}`);
+check("main-loop timers, tasks, frames and trampolined calls all ran",
+  timersRun > rounds && tasksRun === rounds * 50 && framesSeen > 0 && trampolined >= rounds - 2,
+  { timersRun, tasksRun, framesSeen, trampolined, rounds });
+check("no timer, task, frame subscriber or trampolined call is left behind",
+  internals.liveTimers === 0 && internals.tasks === 0 && internals.subscribers === 0 && internals.waiting === 0,
+  internals);
+check("cancelled timers are dropped, not kept", internals.timers < 64, internals.timers);
+check("the thread streamed throughout and answered every ping", streamed > SECONDS * 300 && echoed === rounds * 5, { streamed, echoed });
+check("every short-lived thread started, answered and ended", shortLived === Math.ceil(rounds / 50) && liveThreads().length === 1, { shortLived, live: liveThreads().length });
+await streamer.terminate();
 check("all target/action calls landed", clicks === rounds * 200, `${clicks} vs ${rounds * 200}`);
 
 // The wrapper table is the thing that would grow without bound if the

@@ -33,6 +33,93 @@ const SLACK = CI ? 6 : 2;
 
 initApp();
 
+// ---------------------------------------------------------------------------
+// The main loop (docs/main-loop/spec.md §11, test 8): the pump costs what v1's did, events are
+// as quick to arrive, and a turn's fixed cost is small and written down.
+// ---------------------------------------------------------------------------
+//
+// v1, measured on an M2 Pro (macOS 26.6.2, Bun 1.4.4) back to back with the main loop, alternating
+// runs of each: br_pump(0) 2.07–2.09 µs against 2.08–2.10 µs (2.33 µs while the nesting observer
+// also watched the default mode the pump waits in); an event posted from a Bun timer reaching a
+// monitor under run(), 0.17–0.24 ms median against 0.14–0.30 ms — the same spread, which is the
+// machine's, so the budget allows for it.
+{
+  const { pumpOnce, MainLoop, run, quit } = await import("../src/runtime.ts");
+  const { lib } = await import("../src/bridge.ts");
+  const { objc, createBlock } = await import("../src/objc.ts");
+  const win = new Window({ title: "pump", size: { width: 320, height: 200 }, show: true });
+  for (let i = 0; i < 60; i++) {
+    pumpOnce(0.002);
+    await Bun.sleep(2);
+  }
+  const N = 20_000;
+  const pumpUs = median(7, () => {
+    const t = performance.now();
+    for (let i = 0; i < N; i++) pumpOnce(0);
+    return ((performance.now() - t) * 1000) / N;
+  });
+  check(`a pump with nothing to do costs ${pumpUs.toFixed(2)}us, v1's 2.06us or near it (under ${(2.6 * (CI ? 3 : 1)).toFixed(1)}us)`,
+    pumpUs < 2.6 * (CI ? 3 : 1), pumpUs);
+
+  // A turn's fixed cost: the source firing inside the pump, the call into JavaScript and back,
+  // the checks for work, and the deadline left as it was. Measured at 0.3 µs.
+  const turnUs = median(7, () => {
+    const t = performance.now();
+    for (let i = 0; i < N; i++) {
+      lib.br_main_signal();
+      pumpOnce(0);
+    }
+    return ((performance.now() - t) * 1000) / N;
+  }) - pumpUs;
+  check(`an empty main-loop turn costs ${turnUs.toFixed(2)}us on top of the pump (under ${(2 * SLACK).toFixed(0)}us)`,
+    turnUs < 2 * SLACK, turnUs);
+
+  // A task, with its checkpoint (process.nextTick, then drainMicrotasks): measured at 0.15 µs.
+  const taskUs = median(7, () => {
+    const M = 2000;
+    let n = 0;
+    for (let i = 0; i < M; i++) MainLoop.post(() => void n++);
+    const t = performance.now();
+    while (n < M) pumpOnce(0);
+    return ((performance.now() - t) * 1000) / M;
+  });
+  check(`a posted task, run with its checkpoint, costs ${taskUs.toFixed(2)}us (under ${SLACK.toFixed(0)}us)`,
+    taskUs < SLACK, taskUs);
+
+  // Event latency under run(): an application-defined event posted from a Bun timer, to the
+  // moment a local monitor sees it.
+  const app = objc.NSApplication.sharedApplication();
+  const latencies: number[] = [];
+  let sentAt = 0;
+  const monitor = createBlock("@@?@", (e: any) => {
+    if (Number(e.subtype()) === 7) latencies.push(performance.now() - sentAt);
+    return e;
+  });
+  const token = objc.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(1n << 15n, monitor);
+  let posted = 0;
+  const iv = setInterval(() => {
+    if (posted++ < 200) {
+      sentAt = performance.now();
+      app.postEvent_atStart_(
+        objc.NSEvent.otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(
+          15, { x: 0, y: 0 }, 0, 0, 0, null, 7, 0, 0),
+        false);
+    } else {
+      clearInterval(iv);
+      quit();
+    }
+  }, 7);
+  await run({ quitAfterLastWindow: false });
+  objc.NSEvent.removeMonitor_(token);
+  monitor.dispose();
+  latencies.sort((a, b) => a - b);
+  const latency = latencies[latencies.length >> 1]!;
+  console.log(`  (event latency under run(): median ${latency.toFixed(3)} ms, p90 ${latencies[Math.floor(latencies.length * 0.9)]!.toFixed(3)} ms; v1 0.17–0.24 ms)`);
+  check(`an event reaches JavaScript in ${latency.toFixed(3)}ms median, within v1's spread (under ${(0.5 * (CI ? 4 : 1)).toFixed(1)}ms)`,
+    latency < 0.5 * (CI ? 4 : 1), latency);
+  win.close();
+}
+
 if (!gpuAvailable()) {
   console.log("  (no Metal device here — skipping)");
   console.log("\nPERFORMANCE TESTS SKIPPED");

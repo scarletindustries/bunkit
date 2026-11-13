@@ -29,7 +29,12 @@ static br_void_fn   g_stop_cb = NULL;
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender {
   (void)sender;
   g_stop = 1;
-  if (g_stop_cb) g_stop_cb(0, 0, NULL, NULL);
+  if (g_stop_cb) {
+    // A native → JavaScript entry like any other: counted, so no main-loop turn starts inside it.
+    atomic_fetch_add(&g_br_main.callbackDepth, 1);
+    g_stop_cb(0, 0, NULL, NULL);
+    atomic_fetch_sub(&g_br_main.callbackDepth, 1);
+  }
   return NSTerminateCancel;
 }
 
@@ -86,26 +91,41 @@ int br_pump(double seconds) {
   if (!NSApp) return 0;
   static int idleTicks = 0;
   int n = 0;
+  // A safe point for the main loop for as long as this runs (docs/main-loop/spec.md §3): the
+  // only JavaScript below is whoever called the pump, which waits for it to return.
+  atomic_fetch_add(&g_br_main.inPump, 1);
+  double started = br_now();
+  // A turn that came due while JavaScript was busy, and calls trampolined since the last pump.
+  br_main_run_pending();
   @autoreleasepool {
     NSDate* deadline = seconds > 0 ? [NSDate dateWithTimeIntervalSinceNow:seconds]
                                    : [NSDate distantPast];
     NSEvent* e;
-    while ((e = [NSApp nextEventMatchingMask:NSEventMaskAny
-                                   untilDate:deadline
-                                      inMode:NSDefaultRunLoopMode
-                                     dequeue:YES])) {
+    for (;;) {
+      int waiting = br_main_pump_wait_begin();
+      e = [NSApp nextEventMatchingMask:NSEventMaskAny
+                             untilDate:deadline
+                                inMode:NSDefaultRunLoopMode
+                               dequeue:YES];
+      br_main_pump_wait_end(waiting);
+      if (!e) break;
       // Taken: the next wake-up must post again. Cleared here, not when a pump
       // starts — between two pumps is exactly when JavaScript sends something and
       // the answer arrives, and a flag still set then would let the next pump sleep.
       if ([e type] == NSEventTypeApplicationDefined && [e data1] == BR_WAKE_MARK) {
         atomic_store(&g_wake_pending, 0);
       }
+      // A menu, a live resize or a slider drag runs its own loop in here; the main loop's turns
+      // run inside it, between the callbacks AppKit makes.
+      br_main_dispatch_begin();
       @try {
         [NSApp sendEvent:e];
       } @catch (NSException* ex) {
         NSLog(@"[objcbridge] exception in sendEvent: %@: %@", [ex name], [ex reason]);
       }
+      br_main_dispatch_end();
       n++;
+      br_main_run_pending();
       // Everything after the first event is drained without blocking.
       deadline = [NSDate distantPast];
     }
@@ -122,10 +142,13 @@ int br_pump(double seconds) {
       }
     }
   }
+  br_main_run_pending();
   // And here: one of AppKit's own nested loops (menu tracking, a modal session)
   // may have taken the event instead, and a flag left set would stop every wake-up
   // after it. At worst a second event is posted while one is still queued.
   atomic_store(&g_wake_pending, 0);
+  br_main_pump_end(br_now() - started);
+  atomic_fetch_sub(&g_br_main.inPump, 1);
   return n;
 }
 

@@ -40,6 +40,7 @@
     "./bridge": "./src/bridge.ts",
     "./constants": "./src/generated/constants.ts",
     "./runtime": "./src/runtime.ts",
+    "./thread": "./src/thread.ts",
     "./structs": "./src/structs.ts",
     "./types": "./src/generated/appkit.d.ts",
     "./metal": "./src/metal/index.ts",

@@ -20,6 +20,8 @@ const SUITES = [
   "test/input.ts",
   "test/keys.ts",
   "test/runloop.ts",
+  "test/mainloop.ts",
+  "test/thread.ts",
   "test/net.ts",
   "test/soak.ts",
   "test/net-soak.ts",

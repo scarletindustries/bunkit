@@ -39,6 +39,7 @@ export {
   wrap,
   withPool,
   stats,
+  sendFromPump,
   ObjCObject,
   ObjCClass,
   ObjCBlock,
